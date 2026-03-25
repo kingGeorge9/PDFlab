@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(head -5 \"c:/Users/George/PDFiQ/app/\\(tabs\\)/library.tsx\")"
+    ]
+  }
+}

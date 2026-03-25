@@ -1,17 +1,24 @@
 {
   "expo": {
-    "name": "PDFiQ",
-    "slug": "PDFiQ",
+    "name": "PDFlab",
+    "slug": "PDFlab",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "pdfiq",
+    "scheme": "pdflab",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+    "jsEngine": "hermes",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Allow $(PRODUCT_NAME) to access your microphone for voice transcription."
+      }
     },
     "android": {
+      "enableProguardInReleaseBuilds": true,
+      "enableShrinkResourcesInReleaseBuilds": true,
+      "softwareKeyboardLayoutMode": "resize",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -19,7 +26,9 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "package": "com.chunaemelum.PDFlab",
+      "permissions": ["RECORD_AUDIO"]
     },
     "web": {
       "output": "static",
@@ -38,11 +47,16 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      ["expo-asset", { "assets": ["./assets/fonts", "./assets/images"] }]
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "assetBundlePatterns": ["assets/images/**", "assets/fonts/**"],
+    "extra": {
+      "apiUrl": "http://192.168.43.21:5000/api"
     }
   }
 }
