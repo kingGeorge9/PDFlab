@@ -4,19 +4,24 @@ import { FileSourcePicker, type FileSourceOption } from "@/components/FileSource
 import { LibraryFilePicker, type SelectedFile } from "@/components/LibraryFilePicker";
 import { useFileIndex } from "@/hooks/useFileIndex";
 import { pickFilesWithResult } from "@/services/document-manager";
+import { upsertFileRecord } from "@/services/fileIndexService";
 import { useTheme } from "@/services/ThemeProvider";
 import { useLocalSearchParams, useRouter } from "expo-router";
+import * as Clipboard from "expo-clipboard";
 import * as FileSystem from "expo-file-system/legacy";
+import * as Print from "expo-print";
 import * as Sharing from "expo-sharing";
 import {
   ArrowLeft,
   BookOpen,
+  Check,
+  Copy,
   Download,
   FileText,
   RefreshCw,
   X,
 } from "lucide-react-native";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useState, memo } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -47,6 +52,46 @@ interface ExtractResult {
   citations: Citation[];
   pdfUrl?: string;
   style: string;
+}
+
+function CitationCard({
+  idx,
+  citation,
+  t,
+}: {
+  idx: number;
+  citation: Citation;
+  t: ReturnType<typeof useTheme>["colors"];
+}) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = useCallback(async () => {
+    await Clipboard.setStringAsync(citation.formatted);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }, [citation.formatted]);
+
+  return (
+    <View
+      style={[
+        styles.citationCard,
+        { backgroundColor: t.card, borderColor: t.border },
+      ]}
+    >
+      <Text style={[styles.citationNum, { color: t.textSecondary }]}>
+        [{idx + 1}]
+      </Text>
+      <Text style={[styles.citationText, { color: t.text }]} selectable>
+        {citation.formatted}
+      </Text>
+      <TouchableOpacity onPress={handleCopy} hitSlop={8} style={styles.copyBtn}>
+        {copied ? (
+          <Check size={16} color={colors.success} />
+        ) : (
+          <Copy size={16} color={t.textSecondary} />
+        )}
+      </TouchableOpacity>
+    </View>
+  );
 }
 
 export default function CitationExtractorScreen() {
@@ -184,17 +229,78 @@ export default function CitationExtractorScreen() {
     [result],
   );
 
-  const handleDownload = useCallback(async () => {
-    if (!result?.pdfUrl) return;
+  const handleExportPDF = useCallback(async () => {
+    if (!result || result.citations.length === 0) return;
     try {
-      const filename = `citations_${selectedFile?.name || "export"}.pdf`;
-      const localUri = `${FileSystem.cacheDirectory}${filename}`;
-      const download = await FileSystem.downloadAsync(result.pdfUrl, localUri);
-      if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(download.uri);
+      // Build HTML for expo-print — produces a properly renderable PDF on mobile
+      const rows = result.citations
+        .map(
+          (c, i) =>
+            `<tr><td style="vertical-align:top;padding:4px 8px;color:#6b7280;font-weight:700;white-space:nowrap">[${i + 1}]</td>` +
+            `<td style="padding:4px 8px;line-height:1.6">${c.formatted.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</td></tr>`,
+        )
+        .join("");
+
+      const styleName = result.style?.toUpperCase() || "APA";
+      const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/>
+<style>
+  body { font-family: Georgia, serif; font-size: 12pt; margin: 48px; color: #111; }
+  h1 { font-size: 16pt; margin-bottom: 4px; }
+  .sub { font-size: 10pt; color: #6b7280; margin-bottom: 24px; }
+  table { width: 100%; border-collapse: collapse; }
+  tr { border-bottom: 1px solid #f0f0f0; }
+  td { padding: 6px 8px; }
+</style>
+</head><body>
+<h1>References</h1>
+<p class="sub">${result.citations.length} citation${result.citations.length !== 1 ? "s" : ""} &middot; ${styleName} style</p>
+<table>${rows}</table>
+</body></html>`;
+
+      const { uri: tmpUri } = await Print.printToFileAsync({ html, base64: false });
+
+      // Move to processed-files folder with proper name
+      const baseName = (selectedFile?.name?.replace(/\.[^/.]+$/, "") || "document")
+        .replace(/[/\\?%*:|"<>]/g, "_");
+      const outputName = `Citations from ${baseName}.pdf`;
+      const outputDir = `${FileSystem.documentDirectory}processed-files/`;
+      const dirInfo = await FileSystem.getInfoAsync(outputDir);
+      if (!dirInfo.exists) {
+        await FileSystem.makeDirectoryAsync(outputDir, { intermediates: true });
       }
+      const outputUri = `${outputDir}${outputName}`;
+      await FileSystem.copyAsync({ from: tmpUri, to: outputUri });
+      await FileSystem.deleteAsync(tmpUri, { idempotent: true });
+
+      const fileInfo = await FileSystem.getInfoAsync(outputUri);
+      const fileSize = fileInfo.exists && "size" in fileInfo ? (fileInfo as any).size : 0;
+
+      await upsertFileRecord({
+        uri: outputUri,
+        name: outputName,
+        extension: "pdf",
+        mimeType: "application/pdf",
+        source: "created",
+        size: fileSize,
+      });
+
+      Alert.alert(
+        "PDF Saved",
+        `"${outputName}" has been saved to your library.`,
+        [
+          { text: "OK" },
+          {
+            text: "Share",
+            onPress: async () => {
+              if (await Sharing.isAvailableAsync()) {
+                await Sharing.shareAsync(outputUri, { mimeType: "application/pdf" });
+              }
+            },
+          },
+        ],
+      );
     } catch (err: any) {
-      Alert.alert("Download Failed", err.message);
+      Alert.alert("Export Failed", err.message || "Could not generate PDF.");
     }
   }, [result, selectedFile]);
 
@@ -330,31 +436,19 @@ export default function CitationExtractorScreen() {
                 {result.citations.length} citation
                 {result.citations.length !== 1 ? "s" : ""} found
               </Text>
-              {result.pdfUrl && (
-                <TouchableOpacity onPress={handleDownload} style={styles.pdfBtn}>
-                  <Download size={14} color="#fff" />
-                  <Text style={styles.pdfBtnText}>PDF</Text>
-                </TouchableOpacity>
-              )}
+              <TouchableOpacity onPress={handleExportPDF} style={styles.pdfBtn}>
+                <Download size={14} color="#fff" />
+                <Text style={styles.pdfBtnText}>PDF</Text>
+              </TouchableOpacity>
             </View>
 
             {result.citations.map((cit, idx) => (
-              <View
+              <CitationCard
                 key={idx}
-                style={[
-                  styles.citationCard,
-                  { backgroundColor: t.card, borderColor: t.border },
-                ]}
-              >
-                <Text
-                  style={[styles.citationNum, { color: t.textSecondary }]}
-                >
-                  [{idx + 1}]
-                </Text>
-                <Text style={[styles.citationText, { color: t.text }]}>
-                  {cit.formatted}
-                </Text>
-              </View>
+                idx={idx}
+                citation={cit}
+                t={t}
+              />
             ))}
           </View>
         )}
@@ -453,4 +547,5 @@ const styles = StyleSheet.create({
   },
   citationNum: { fontSize: 13, fontWeight: "700", minWidth: 24 },
   citationText: { flex: 1, fontSize: 14, lineHeight: 20 },
+  copyBtn: { padding: 6, alignSelf: "flex-start" },
 });

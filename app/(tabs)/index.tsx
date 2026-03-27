@@ -124,6 +124,11 @@ export default function HomeScreen() {
   const [showMethodDialog, setShowMethodDialog] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
 
+  // Bento box shrink/dim animation when searching
+  const bentoScale = useRef(new RNAnimated.Value(1)).current;
+  const bentoOpacity = useRef(new RNAnimated.Value(1)).current;
+  const isSearching = searchQuery.trim().length > 0;
+
   // AI feature text animation — slide in from right, hold, fade out, next slides in
   const aiFeatureIndex = useRef(0);
   const aiSlideAnim = useRef(new RNAnimated.Value(40)).current;
@@ -201,6 +206,24 @@ export default function HomeScreen() {
       if (rafId !== null) cancelAnimationFrame(rafId);
     };
   }, []);
+
+  // Animate bento box shrink + dim when user is searching
+  useEffect(() => {
+    RNAnimated.parallel([
+      RNAnimated.timing(bentoScale, {
+        toValue: isSearching ? 0.95 : 1,
+        duration: 250,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+      RNAnimated.timing(bentoOpacity, {
+        toValue: isSearching ? 0.35 : 1,
+        duration: 250,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [isSearching]);
 
   // Throttle focus-refresh to avoid spamming AsyncStorage on rapid tab switches
   const lastRefreshRef = useRef(0);
@@ -634,7 +657,16 @@ export default function HomeScreen() {
           contentContainerStyle={styles.scrollContent}
         >
           {/* Bento Box Quick Actions */}
-          <View style={styles.bentoSectionContainer}>
+          <RNAnimated.View
+            style={[
+              styles.bentoSectionContainer,
+              {
+                transform: [{ scale: bentoScale }],
+                opacity: bentoOpacity,
+              },
+            ]}
+            pointerEvents={isSearching ? "none" : "auto"}
+          >
             {/* Bento Grid Layout */}
             <View
               style={[
@@ -809,14 +841,14 @@ export default function HomeScreen() {
                 </View>
               </View>
             </View>
-          </View>
+          </RNAnimated.View>
 
           {/* Recent Files Section */}
           {!settings.hideRecentFiles && (
             <View style={styles.sectionContainer}>
               <View style={styles.sectionHeader}>
                 <Text style={[styles.sectionTitle, { color: textColor }]}>
-                  Recent Files
+                  {isSearching ? "Search Results" : "Recent Files"}
                 </Text>
               </View>
 

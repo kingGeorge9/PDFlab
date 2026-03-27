@@ -74,7 +74,7 @@ export default function FindReplaceScreen() {
   // File source picker state
   const [showSourcePicker, setShowSourcePicker] = useState(false);
   const [showLibraryPicker, setShowLibraryPicker] = useState(false);
-  const { files: libraryFiles } = useFileIndex();
+  const { files: libraryFiles, addFile } = useFileIndex();
 
   const hasLibraryPdfs = useMemo(
     () => libraryFiles.some((f) => f.extension?.toLowerCase() === "pdf" || f.type?.toLowerCase() === "pdf"),
@@ -135,6 +135,9 @@ export default function FindReplaceScreen() {
 
       const data = await response.json();
       setMatches(data.matches || []);
+      if (data.warning) {
+        setError(data.warning);
+      }
     } catch (err: any) {
       setError(err.message || "Preview failed");
     } finally {
@@ -166,11 +169,25 @@ export default function FindReplaceScreen() {
       const data = await response.json();
       if (!data.downloadUrl) throw new Error("No download URL returned from server");
 
-      const outputUri = `${FileSystem.cacheDirectory}replaced_${selectedFile.name}`;
+      // Save to documents directory so it persists, then register in the library
+      const outputDir = `${FileSystem.documentDirectory}pdfiq-outputs/`;
+      await FileSystem.makeDirectoryAsync(outputDir, { intermediates: true });
+      const outputName = `replaced_${selectedFile.name}`;
+      const outputUri = `${outputDir}${outputName}`;
       const downloadResult = await FileSystem.downloadAsync(data.downloadUrl, outputUri);
       if (downloadResult.status !== 200) {
         throw new Error(`Download failed with status ${downloadResult.status}`);
       }
+
+      // Register in the app library
+      await addFile({
+        uri: outputUri,
+        name: outputName,
+        type: "pdf",
+        extension: "pdf",
+        mimeType: "application/pdf",
+        source: "created",
+      });
 
       setResultUri(outputUri);
       setDone(true);

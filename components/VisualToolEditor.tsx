@@ -18,11 +18,10 @@ import {
 } from "lucide-react-native";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
-  FlatList,
   GestureResponderEvent,
   LayoutChangeEvent,
-  Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -89,6 +88,7 @@ interface Props {
   placement: PlacementResult;
   onPlacementChange: (placement: PlacementResult) => void;
   previewLabel?: string;
+  onScrollLock?: (locked: boolean) => void;
   t: ThemeColors;
 }
 
@@ -101,6 +101,7 @@ interface CropProps {
   cropMargins: CropMargins;
   onCropChange: (margins: CropMargins) => void;
   onScrollLock?: (locked: boolean) => void;
+  requestedPage?: number;
   t: ThemeColors;
 }
 
@@ -153,6 +154,7 @@ export const VisualToolEditor: React.FC<Props> = ({
   placement,
   onPlacementChange,
   previewLabel,
+  onScrollLock,
   t,
 }) => {
   const pdfW = propPageWidth || DEFAULT_PDF_WIDTH;
@@ -171,8 +173,8 @@ export const VisualToolEditor: React.FC<Props> = ({
     startPdfY: 0,
   });
 
-  // FlatList state
-  const flatListRef = useRef<FlatList>(null);
+  // ScrollView state
+  const scrollViewRef = useRef<ScrollView>(null);
   const [currentVisiblePage, setCurrentVisiblePage] = useState(0);
   const [goToPageText, setGoToPageText] = useState(
     String(placement.pageNumber + 1),
@@ -259,6 +261,7 @@ export const VisualToolEditor: React.FC<Props> = ({
   const handleDragStart = useCallback(
     (evt: GestureResponderEvent) => {
       setIsDragging(true);
+      onScrollLock?.(true);
       const { pageX, pageY } = evt.nativeEvent;
       dragStartRef.current = {
         pageX,
@@ -267,7 +270,7 @@ export const VisualToolEditor: React.FC<Props> = ({
         startPdfY: placement.y,
       };
     },
-    [placement.x, placement.y],
+    [placement.x, placement.y, onScrollLock],
   );
 
   const handleDragMove = useCallback(
@@ -304,7 +307,8 @@ export const VisualToolEditor: React.FC<Props> = ({
 
   const handleDragEnd = useCallback(() => {
     setIsDragging(false);
-  }, []);
+    onScrollLock?.(false);
+  }, [onScrollLock]);
 
   const handlePageChange = (delta: number) => {
     const newPage = Math.max(
@@ -324,185 +328,48 @@ export const VisualToolEditor: React.FC<Props> = ({
     });
   };
 
-  // FlatList helpers
-  const getItemLayout = useCallback(
-    (_: any, index: number) => ({
-      length: itemTotalH,
-      offset: itemTotalH * index,
-      index,
-    }),
-    [itemTotalH],
-  );
-
-  const pageKeyExtractor = useCallback(
-    (item: number) => `vte-page-${item}`,
-    [],
-  );
-
-  const viewabilityConfig = useRef({
-    viewAreaCoveragePercentThreshold: 50,
-  }).current;
-
-  const handleViewableItemsChanged = useRef(
-    ({ viewableItems }: { viewableItems: Array<{ index: number | null }> }) => {
-      if (viewableItems.length > 0 && viewableItems[0].index != null) {
-        setCurrentVisiblePage(viewableItems[0].index);
+  // ScrollView helpers
+  const handleScroll = useCallback(
+    (e: { nativeEvent: { contentOffset: { y: number } } }) => {
+      if (itemTotalH > 0) {
+        const page = Math.round(e.nativeEvent.contentOffset.y / itemTotalH);
+        setCurrentVisiblePage(Math.max(0, Math.min(page, totalPages - 1)));
       }
     },
-  ).current;
+    [itemTotalH, totalPages],
+  );
 
   const handleGoToPage = useCallback(() => {
     const target = parseInt(goToPageText, 10);
     if (isNaN(target) || target < 1 || target > totalPages) return;
     const pageIdx = target - 1;
     onPlacementChange({ ...placement, pageNumber: pageIdx });
-    try {
-      flatListRef.current?.scrollToIndex({
-        index: pageIdx,
-        animated: true,
-        viewPosition: 0.3,
-      });
-    } catch {}
-  }, [goToPageText, totalPages, placement, onPlacementChange]);
+    scrollViewRef.current?.scrollTo({ y: pageIdx * itemTotalH, animated: true });
+  }, [goToPageText, totalPages, placement, onPlacementChange, itemTotalH]);
 
   const handleJumpToElementPage = useCallback(() => {
-    try {
-      flatListRef.current?.scrollToIndex({
-        index: placement.pageNumber,
-        animated: true,
-        viewPosition: 0.3,
-      });
-    } catch {}
-  }, [placement.pageNumber]);
+    scrollViewRef.current?.scrollTo({
+      y: placement.pageNumber * itemTotalH,
+      animated: true,
+    });
+  }, [placement.pageNumber, itemTotalH]);
 
   // Sync goToPageText when placement page changes
   useEffect(() => {
     setGoToPageText(String(placement.pageNumber + 1));
   }, [placement.pageNumber]);
 
-  // Auto-scroll to element page when FlatList first mounts
+  // Auto-scroll to element page on first mount
   useEffect(() => {
-    if (flatListRef.current && itemTotalH > 0 && placement.pageNumber > 0) {
+    if (itemTotalH > 0 && placement.pageNumber > 0) {
       setTimeout(() => {
-        try {
-          flatListRef.current?.scrollToIndex({
-            index: placement.pageNumber,
-            animated: false,
-            viewPosition: 0.3,
-          });
-        } catch {}
+        scrollViewRef.current?.scrollTo({
+          y: placement.pageNumber * itemTotalH,
+          animated: false,
+        });
       }, 300);
     }
   }, [itemTotalH]);
-
-  const renderPageItem = useCallback(
-    ({ item: pageIndex }: { item: number }) => {
-      const isElementPage = pageIndex === placement.pageNumber;
-      return (
-        <Pressable
-          style={[
-            vs.pageItemContainer,
-            {
-              width: containerW,
-              height: pageRenderH,
-              borderColor: isElementPage ? color : "transparent",
-            },
-          ]}
-          onPress={() => {
-            if (!isElementPage) {
-              onPlacementChange({ ...placement, pageNumber: pageIndex });
-            }
-          }}
-        >
-          <Pdf
-            source={{ uri: fileUri, cache: true }}
-            page={pageIndex + 1}
-            enablePaging={true}
-            fitPolicy={2}
-            minScale={1}
-            maxScale={1}
-            style={vs.pdfPageFill}
-            onError={(err: any) =>
-              console.warn("PDF page render error:", err)
-            }
-          />
-          {!isElementPage && (
-            <View style={vs.pageTapTarget} pointerEvents="box-none">
-              <View style={[vs.pageTapHint, { backgroundColor: color + "80" }]}>
-                <Text style={vs.pageTapHintText}>Tap to place here</Text>
-              </View>
-            </View>
-          )}
-          {isElementPage && (
-            <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
-              <View
-                style={[
-                  vs.placedElement,
-                  {
-                    left: elScreenX,
-                    top: elScreenY,
-                    width: elW,
-                    height: elH,
-                    backgroundColor:
-                      toolType === "redact" ? color : color + "20",
-                    borderColor: color,
-                    borderWidth: toolType === "redact" ? 0 : 2,
-                    borderStyle: "dashed",
-                  },
-                ]}
-                onStartShouldSetResponder={() => true}
-                onMoveShouldSetResponder={() => true}
-                onResponderTerminationRequest={() => false}
-                onResponderGrant={handleDragStart}
-                onResponderMove={handleDragMove}
-                onResponderRelease={handleDragEnd}
-              >
-                {toolType !== "redact" && (
-                  <Text
-                    style={[vs.elementLabel, { color }]}
-                    numberOfLines={1}
-                  >
-                    {previewLabel || toolType.replace("-", " ")}
-                  </Text>
-                )}
-                <View
-                  style={[vs.dragHandle, { backgroundColor: color + "30" }]}
-                >
-                  <GripVertical color={color} size={14} />
-                </View>
-              </View>
-            </View>
-          )}
-          {/* Page number badge */}
-          <View
-            style={[
-              vs.pageNumberBadge,
-              isElementPage && { backgroundColor: color },
-            ]}
-          >
-            <Text style={vs.pageNumberText}>{pageIndex + 1}</Text>
-          </View>
-        </Pressable>
-      );
-    },
-    [
-      containerW,
-      pageRenderH,
-      placement,
-      onPlacementChange,
-      elScreenX,
-      elScreenY,
-      elW,
-      elH,
-      color,
-      toolType,
-      previewLabel,
-      fileUri,
-      handleDragStart,
-      handleDragMove,
-      handleDragEnd,
-    ],
-  );
 
   // ── Render ────────────────────────────────────────────────────────
 
@@ -583,30 +450,107 @@ export const VisualToolEditor: React.FC<Props> = ({
           <GestureHandlerRootView style={{ flex: 1 }}>
             <GestureDetector gesture={pinchGesture}>
               <Animated.View style={[{ flex: 1 }, zoomAnimatedStyle]}>
-                <FlatList
-                  ref={flatListRef}
-                  data={pageIndices}
-                  keyExtractor={pageKeyExtractor}
-                  renderItem={renderPageItem}
-                  getItemLayout={getItemLayout}
+                <ScrollView
+                  ref={scrollViewRef}
                   scrollEnabled={!isDragging}
                   nestedScrollEnabled
-                  initialNumToRender={3}
-                  windowSize={5}
-                  maxToRenderPerBatch={2}
-                  removeClippedSubviews={Platform.OS !== "web"}
-                  onViewableItemsChanged={handleViewableItemsChanged}
-                  viewabilityConfig={viewabilityConfig}
                   showsVerticalScrollIndicator
-                  ItemSeparatorComponent={VTEPageSeparator}
-                  onScrollToIndexFailed={({ index }) => {
-                    flatListRef.current?.scrollToOffset({
-                      offset: index * itemTotalH,
-                      animated: true,
-                    });
-                  }}
-                  extraData={`${placement.pageNumber}-${placement.x}-${placement.y}`}
-                />
+                  onScroll={handleScroll}
+                  scrollEventThrottle={100}
+                >
+                  {pageIndices.map((pageIndex) => {
+                    const isElementPage = pageIndex === placement.pageNumber;
+                    return (
+                      <React.Fragment key={`vte-page-${pageIndex}`}>
+                        <Pressable
+                          style={[
+                            vs.pageItemContainer,
+                            {
+                              width: containerW,
+                              height: pageRenderH,
+                              borderColor: isElementPage ? color : "transparent",
+                            },
+                          ]}
+                          onPress={() => {
+                            if (!isElementPage) {
+                              onPlacementChange({ ...placement, pageNumber: pageIndex });
+                            }
+                          }}
+                        >
+                          <Pdf
+                            source={{ uri: fileUri, cache: true }}
+                            page={pageIndex + 1}
+                            enablePaging={true}
+                            fitPolicy={2}
+                            minScale={1}
+                            maxScale={1}
+                            style={vs.pdfPageFill}
+                            onError={(err: any) =>
+                              console.warn("PDF page render error:", err)
+                            }
+                          />
+                          {!isElementPage && (
+                            <View style={vs.pageTapTarget} pointerEvents="box-none">
+                              <View style={[vs.pageTapHint, { backgroundColor: color + "80" }]}>
+                                <Text style={vs.pageTapHintText}>Tap to place here</Text>
+                              </View>
+                            </View>
+                          )}
+                          {isElementPage && (
+                            <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
+                              <View
+                                style={[
+                                  vs.placedElement,
+                                  {
+                                    left: elScreenX,
+                                    top: elScreenY,
+                                    width: elW,
+                                    height: elH,
+                                    backgroundColor:
+                                      toolType === "redact" ? color : color + "20",
+                                    borderColor: color,
+                                    borderWidth: toolType === "redact" ? 0 : 2,
+                                    borderStyle: "dashed",
+                                  },
+                                ]}
+                                onStartShouldSetResponder={() => true}
+                                onMoveShouldSetResponder={() => true}
+                                onResponderTerminationRequest={() => false}
+                                onResponderGrant={handleDragStart}
+                                onResponderMove={handleDragMove}
+                                onResponderRelease={handleDragEnd}
+                              >
+                                {toolType !== "redact" && (
+                                  <Text
+                                    style={[vs.elementLabel, { color }]}
+                                    numberOfLines={1}
+                                  >
+                                    {previewLabel || toolType.replace("-", " ")}
+                                  </Text>
+                                )}
+                                <View
+                                  style={[vs.dragHandle, { backgroundColor: color + "30" }]}
+                                >
+                                  <GripVertical color={color} size={14} />
+                                </View>
+                              </View>
+                            </View>
+                          )}
+                          {/* Page number badge */}
+                          <View
+                            style={[
+                              vs.pageNumberBadge,
+                              isElementPage && { backgroundColor: color },
+                            ]}
+                          >
+                            <Text style={vs.pageNumberText}>{pageIndex + 1}</Text>
+                          </View>
+                        </Pressable>
+                        {pageIndex < totalPages - 1 && <VTEPageSeparator />}
+                      </React.Fragment>
+                    );
+                  })}
+                </ScrollView>
               </Animated.View>
             </GestureDetector>
           </GestureHandlerRootView>
@@ -748,6 +692,7 @@ export const VisualCropEditor: React.FC<CropProps> = ({
   cropMargins,
   onCropChange,
   onScrollLock,
+  requestedPage,
   t,
 }) => {
   const pdfW = propPageWidth || DEFAULT_PDF_WIDTH;
@@ -755,6 +700,13 @@ export const VisualCropEditor: React.FC<CropProps> = ({
 
   const [containerW, setContainerW] = useState(0);
   const [previewPage, setPreviewPage] = useState(1); // 1-indexed
+
+  // Sync preview page when parent requests a specific page
+  useEffect(() => {
+    if (requestedPage && requestedPage >= 1 && requestedPage <= pageCount) {
+      setPreviewPage(requestedPage);
+    }
+  }, [requestedPage, pageCount]);
   const [showInputs, setShowInputs] = useState(false);
   const [marginInputs, setMarginInputs] = useState({
     top: "0",
@@ -788,9 +740,9 @@ export const VisualCropEditor: React.FC<CropProps> = ({
   const dimW = Math.round(pdfW - cropMargins.left - cropMargins.right);
   const dimH = Math.round(pdfH - cropMargins.top - cropMargins.bottom);
 
-  // Gesture state
+  // Gesture state — edges + move only (no corner handles)
   const activeEdgeRef = useRef<
-    "top" | "bottom" | "left" | "right" | "move" | "tl" | "tr" | "bl" | "br" | null
+    "top" | "bottom" | "left" | "right" | "move" | null
   >(null);
   const dragStartRef = useRef({
     pageX: 0,
@@ -798,8 +750,7 @@ export const VisualCropEditor: React.FC<CropProps> = ({
     margins: { top: 0, right: 0, bottom: 0, left: 0 },
   });
 
-  const CORNER_HIT = 30; // px radius to register a corner touch
-  const EDGE_HIT = 22;   // px from edge line to register an edge touch
+  const EDGE_HIT = 28; // px from edge line to register an edge touch
 
   const handleContainerLayout = useCallback((e: LayoutChangeEvent) => {
     setContainerW(e.nativeEvent.layout.width);
@@ -809,44 +760,27 @@ export const VisualCropEditor: React.FC<CropProps> = ({
     (evt: GestureResponderEvent) => {
       const { locationX: lx, locationY: ly, pageX, pageY } = evt.nativeEvent;
 
-      // Corner detection (highest priority — bigger hit area)
-      const corners = [
-        { name: "tl" as const, x: cL, y: cT },
-        { name: "tr" as const, x: cR, y: cT },
-        { name: "bl" as const, x: cL, y: cB },
-        { name: "br" as const, x: cR, y: cB },
-      ];
-      let active: typeof activeEdgeRef.current = null;
-      let bestDist = CORNER_HIT;
-      for (const c of corners) {
-        const d = Math.sqrt((lx - c.x) ** 2 + (ly - c.y) ** 2);
-        if (d < bestDist) {
-          bestDist = d;
-          active = c.name;
-        }
-      }
+      // Edge detection
+      const dT = Math.abs(ly - cT);
+      const dB = Math.abs(ly - cB);
+      const dL = Math.abs(lx - cL);
+      const dR = Math.abs(lx - cR);
+      const inH = lx > cL - EDGE_HIT && lx < cR + EDGE_HIT;
+      const inV = ly > cT - EDGE_HIT && ly < cB + EDGE_HIT;
+      const candidates = [
+        { name: "top" as const, dist: dT, ok: dT < EDGE_HIT && inH },
+        { name: "bottom" as const, dist: dB, ok: dB < EDGE_HIT && inH },
+        { name: "left" as const, dist: dL, ok: dL < EDGE_HIT && inV },
+        { name: "right" as const, dist: dR, ok: dR < EDGE_HIT && inV },
+      ]
+        .filter((e) => e.ok)
+        .sort((a, b) => a.dist - b.dist);
 
-      if (!active) {
-        // Edge detection
-        const dT = Math.abs(ly - cT);
-        const dB = Math.abs(ly - cB);
-        const dL = Math.abs(lx - cL);
-        const dR = Math.abs(lx - cR);
-        const inH = lx > cL - EDGE_HIT && lx < cR + EDGE_HIT;
-        const inV = ly > cT - EDGE_HIT && ly < cB + EDGE_HIT;
-        const candidates = [
-          { name: "top" as const, dist: dT, ok: dT < EDGE_HIT && inH },
-          { name: "bottom" as const, dist: dB, ok: dB < EDGE_HIT && inH },
-          { name: "left" as const, dist: dL, ok: dL < EDGE_HIT && inV },
-          { name: "right" as const, dist: dR, ok: dR < EDGE_HIT && inV },
-        ]
-          .filter((e) => e.ok)
-          .sort((a, b) => a.dist - b.dist);
-        if (candidates.length > 0) {
-          active = candidates[0].name;
-        } else if (lx > cL && lx < cR && ly > cT && ly < cB) {
-          active = "move";
-        }
+      let active: typeof activeEdgeRef.current = null;
+      if (candidates.length > 0) {
+        active = candidates[0].name;
+      } else if (lx > cL && lx < cR && ly > cT && ly < cB) {
+        active = "move";
       }
 
       activeEdgeRef.current = active;
@@ -878,22 +812,6 @@ export const VisualCropEditor: React.FC<CropProps> = ({
           n.left = Math.max(0, Math.min(margins.left + dx, pdfW - margins.right - MIN_CROP));
           break;
         case "right":
-          n.right = Math.max(0, Math.min(margins.right - dx, pdfW - margins.left - MIN_CROP));
-          break;
-        case "tl":
-          n.top = Math.max(0, Math.min(margins.top + dy, pdfH - margins.bottom - MIN_CROP));
-          n.left = Math.max(0, Math.min(margins.left + dx, pdfW - margins.right - MIN_CROP));
-          break;
-        case "tr":
-          n.top = Math.max(0, Math.min(margins.top + dy, pdfH - margins.bottom - MIN_CROP));
-          n.right = Math.max(0, Math.min(margins.right - dx, pdfW - margins.left - MIN_CROP));
-          break;
-        case "bl":
-          n.bottom = Math.max(0, Math.min(margins.bottom - dy, pdfH - margins.top - MIN_CROP));
-          n.left = Math.max(0, Math.min(margins.left + dx, pdfW - margins.right - MIN_CROP));
-          break;
-        case "br":
-          n.bottom = Math.max(0, Math.min(margins.bottom - dy, pdfH - margins.top - MIN_CROP));
           n.right = Math.max(0, Math.min(margins.right - dx, pdfW - margins.left - MIN_CROP));
           break;
         case "move": {
@@ -933,7 +851,6 @@ export const VisualCropEditor: React.FC<CropProps> = ({
   };
 
   const CCOLOR = themeColors.info;
-  const HANDLE_VIS = 14; // visual size of corner handle dot
 
   return (
     <View style={vs.container}>
@@ -1025,22 +942,6 @@ export const VisualCropEditor: React.FC<CropProps> = ({
               </View>
             )}
 
-            {/* Corner handles (square, high-contrast) */}
-            {([
-              [cL - HANDLE_VIS / 2, cT - HANDLE_VIS / 2],
-              [cR - HANDLE_VIS / 2, cT - HANDLE_VIS / 2],
-              [cL - HANDLE_VIS / 2, cB - HANDLE_VIS / 2],
-              [cR - HANDLE_VIS / 2, cB - HANDLE_VIS / 2],
-            ] as [number, number][]).map(([x, y], i) => (
-              <View key={i} style={[cropS.cornerHandle, { left: x, top: y, width: HANDLE_VIS, height: HANDLE_VIS }]} pointerEvents="none" />
-            ))}
-
-            {/* Edge midpoint handles */}
-            <View style={[cropS.edgeH, { left: cL + cW / 2 - 16, top: cT - 3 }]} pointerEvents="none" />
-            <View style={[cropS.edgeH, { left: cL + cW / 2 - 16, top: cB - 3 }]} pointerEvents="none" />
-            <View style={[cropS.edgeV, { left: cL - 3, top: cT + cH / 2 - 16 }]} pointerEvents="none" />
-            <View style={[cropS.edgeV, { left: cR - 3, top: cT + cH / 2 - 16 }]} pointerEvents="none" />
-
             {/* Dimension label inside crop area */}
             {cW > 90 && cH > 30 && (
               <View style={[cropS.dimLabel, { left: cL + cW / 2 - 40, top: cT + cH / 2 - 14 }]} pointerEvents="none">
@@ -1051,40 +952,47 @@ export const VisualCropEditor: React.FC<CropProps> = ({
         )}
       </View>
 
-      {/* Bottom controls: chips + toggle numeric inputs */}
+      {/* Bottom controls — centered Edit values + Reset */}
       <View style={[vs.controls, { backgroundColor: t.card, borderTopColor: t.border }]}>
-        <View style={vs.coordRow}>
-          {(["top", "bottom", "left", "right"] as const).map((field) => (
-            <View key={field} style={[vs.coordChip, { backgroundColor: t.backgroundSecondary }]}>
-              <Text style={{ fontSize: 11, color: t.textSecondary }}>
-                {field[0].toUpperCase()}: {Math.round(cropMargins[field])}
-              </Text>
-            </View>
-          ))}
-          <View style={{ flex: 1 }} />
+        <View style={{ flexDirection: "row", justifyContent: "center", gap: 12 }}>
           <TouchableOpacity
             onPress={() => setShowInputs((v) => !v)}
-            style={[vs.resetBtn, { backgroundColor: t.backgroundSecondary }]}
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              paddingHorizontal: 16,
+              paddingVertical: 8,
+              borderRadius: 10,
+              backgroundColor: t.backgroundSecondary,
+            }}
           >
-            <Text style={{ fontSize: 11, color: t.textSecondary }}>
-              {showInputs ? "Hide" : "Edit values"}
+            <Text style={{ fontSize: 13, fontWeight: "600", color: t.text }}>
+              {showInputs ? "Hide values" : "Edit values"}
             </Text>
           </TouchableOpacity>
           <TouchableOpacity
             onPress={handleReset}
-            style={[vs.resetBtn, { backgroundColor: t.backgroundSecondary }]}
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 5,
+              paddingHorizontal: 16,
+              paddingVertical: 8,
+              borderRadius: 10,
+              backgroundColor: t.backgroundSecondary,
+            }}
           >
             <RotateCcw color={t.textSecondary} size={14} />
-            <Text style={{ fontSize: 11, color: t.textSecondary, marginLeft: 4 }}>Reset</Text>
+            <Text style={{ fontSize: 13, fontWeight: "600", color: t.textSecondary }}>Reset</Text>
           </TouchableOpacity>
         </View>
 
         {/* Numeric margin inputs (collapsible) */}
         {showInputs && (
-          <View style={{ flexDirection: "row", gap: 8, marginTop: 10 }}>
+          <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
             {(["top", "bottom", "left", "right"] as const).map((field) => (
               <View key={field} style={{ flex: 1 }}>
-                <Text style={{ fontSize: 10, color: t.textSecondary, marginBottom: 3, textAlign: "center" }}>
+                <Text style={{ fontSize: 11, color: t.textSecondary, marginBottom: 4, textAlign: "center" }}>
                   {field.charAt(0).toUpperCase() + field.slice(1)}
                 </Text>
                 <TextInput
@@ -1352,27 +1260,6 @@ const cropS = StyleSheet.create({
     shadowOpacity: 0.12,
     shadowRadius: 8,
     elevation: 4,
-  },
-  cornerHandle: {
-    position: "absolute",
-    borderRadius: 3,
-    backgroundColor: "#fff",
-    borderWidth: 2.5,
-    borderColor: themeColors.info,
-  },
-  edgeH: {
-    position: "absolute",
-    width: 32,
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: "#fff",
-  },
-  edgeV: {
-    position: "absolute",
-    width: 6,
-    height: 32,
-    borderRadius: 3,
-    backgroundColor: "#fff",
   },
   dimLabel: {
     position: "absolute",

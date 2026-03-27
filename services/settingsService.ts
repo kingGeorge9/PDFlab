@@ -98,7 +98,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultPageRangeFormat: "dash",
   rememberLastPage: true,
 
-  readAloud: false,
+  readAloud: true,
   autoDetectLanguage: true,
   readingVoice: "system",
   readingSpeed: 1.0,

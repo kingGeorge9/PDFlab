@@ -145,13 +145,19 @@ export const MobileRenderer = forwardRef<MobileRendererHandle, Props>(
           const fb = Math.max(0, Math.min(100, fallbackPercent));
           inject(
             `(function(){` +
+            `var prev=document.getElementById('_ra_hl');if(prev)prev.remove();` +
             `var s=${escaped};` +
             `var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);` +
             `while(w.nextNode()){` +
             `var t=w.currentNode.textContent;` +
-            `if(t&&t.indexOf(s)!==-1){` +
-            `var r=document.createRange();r.selectNodeContents(w.currentNode);` +
-            `var rect=r.getBoundingClientRect();` +
+            `var idx=t?t.indexOf(s):-1;` +
+            `if(idx!==-1){` +
+            `var r=document.createRange();` +
+            `r.setStart(w.currentNode,idx);r.setEnd(w.currentNode,Math.min(idx+s.length,t.length));` +
+            `var hl=document.createElement('mark');hl.id='_ra_hl';` +
+            `hl.style.cssText='background:#4F46E540;border-radius:3px;transition:background 0.3s;';` +
+            `r.surroundContents(hl);` +
+            `var rect=hl.getBoundingClientRect();` +
             `window.scrollTo({top:Math.max(0,window.scrollY+rect.top-80),behavior:'smooth'});` +
             `return;}}` +
             `window.scrollTo({top:document.documentElement.scrollHeight*${fb}/100,behavior:'smooth'});` +

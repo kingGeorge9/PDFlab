@@ -76,8 +76,8 @@ const TOOL_ENDPOINTS: Record<string, ToolEndpointConfig> = {
   },
   split: {
     endpoint: API_ENDPOINTS.PDF.SPLIT,
-    outputExtension: "zip",
-    outputMimeType: "application/zip",
+    outputExtension: "json",
+    outputMimeType: "application/json",
     multipleOutputs: true,
   },
   remove: {
@@ -290,8 +290,8 @@ const TOOL_ENDPOINTS: Record<string, ToolEndpointConfig> = {
   // Compare tools
   compare: {
     endpoint: API_ENDPOINTS.PDF.COMPARE,
-    outputExtension: "pdf",
-    outputMimeType: "application/pdf",
+    outputExtension: "json",
+    outputMimeType: "application/json",
   },
   diff: {
     endpoint: `${API_BASE_URL}/pdf/diff`,
@@ -305,11 +305,6 @@ const TOOL_ENDPOINTS: Record<string, ToolEndpointConfig> = {
   },
 
   // Forms tools
-  "create-form": {
-    endpoint: `${API_BASE_URL}/pdf/create-form`,
-    outputExtension: "pdf",
-    outputMimeType: "application/pdf",
-  },
   "fill-form": {
     endpoint: `${API_BASE_URL}/pdf/fill-form`,
     outputExtension: "pdf",
@@ -400,23 +395,13 @@ const TOOL_ENDPOINTS: Record<string, ToolEndpointConfig> = {
   },
   "find-replace": {
     endpoint: `${API_BASE_URL}/find-replace`,
-    outputExtension: "pdf",
-    outputMimeType: "application/pdf",
-  },
-  "true-redact": {
-    endpoint: `${API_BASE_URL}/true-redact`,
-    outputExtension: "pdf",
-    outputMimeType: "application/pdf",
+    outputExtension: "json",
+    outputMimeType: "application/json",
   },
   "qr-code": {
     endpoint: `${API_BASE_URL}/qrcode`,
     outputExtension: "pdf",
     outputMimeType: "application/pdf",
-  },
-  "lock-document": {
-    endpoint: `${API_BASE_URL}/lock/set`,
-    outputExtension: "json",
-    outputMimeType: "application/json",
   },
   "highlight-export": {
     endpoint: `${API_BASE_URL}/highlight-export`,
@@ -567,8 +552,7 @@ export async function processWithTool(
 
   // Check file size (skip for tools that don't require an input file)
   const noFileTools = ["text-to-pdf"];
-  const isBlankCreateForm = toolId === "create-form" && !fileUri;
-  if (!noFileTools.includes(toolId) && !isBlankCreateForm) {
+  if (!noFileTools.includes(toolId)) {
     onProgress?.(5, "Validating file...");
     const fileSize = await checkFileSize(fileUri);
     if (fileSize > MAX_FILE_SIZE) {
@@ -590,9 +574,6 @@ export async function processWithTool(
       if (params?.text) {
         formData.append("text", params.text);
       }
-    } else if (toolId === "create-form" && !fileUri) {
-      // Blank form creation: no file, just send fields param
-      // (file append is skipped; params added below)
     } else if (toolId === "merge") {
       // Merge: send ALL files (main + additional) under "pdfs" key
       formData.append("pdfs", {
@@ -747,6 +728,7 @@ export async function processWithTool(
       "validate",
       "extract-data",
       "diff",
+      "compare",
       "ocr",
       "read-aloud",
     ];
@@ -770,6 +752,37 @@ export async function processWithTool(
           outputType: "json",
           jsonData: result,
         } as any;
+      }
+
+      // Split tool returns multiple files — download each individually
+      if (result.success && result.files && Array.isArray(result.files)) {
+        const savedFiles: string[] = [];
+        const pdfConfig = { ...toolConfig, outputExtension: "pdf", outputMimeType: "application/pdf" };
+        for (let i = 0; i < result.files.length; i++) {
+          const f = result.files[i];
+          onProgress?.(
+            60 + Math.round((i / result.files.length) * 30),
+            `Downloading part ${i + 1} of ${result.files.length}...`,
+          );
+          const partResult = await downloadAndSaveFile(
+            f.url,
+            f.filename || `${fileName.replace(/\.pdf$/i, "")}_part_${i + 1}.pdf`,
+            toolId,
+            pdfConfig,
+            undefined,
+          );
+          if (partResult.success && partResult.outputUri) {
+            savedFiles.push(partResult.outputUri);
+          }
+        }
+        onProgress?.(100, "Complete!");
+        return {
+          success: true,
+          outputUri: savedFiles[0] || "",
+          outputFileName: result.files[0]?.filename || `${fileName.replace(/\.pdf$/i, "")}_part_1.pdf`,
+          outputType: "application/pdf",
+          message: `Split into ${savedFiles.length} files. All files saved to library.`,
+        };
       }
 
       if (result.downloadUrl) {

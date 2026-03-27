@@ -76,7 +76,7 @@ export default function QRCodeScreen() {
   // File source picker
   const [showSourcePicker, setShowSourcePicker] = useState(false);
   const [showLibraryPicker, setShowLibraryPicker] = useState(false);
-  const { files: libraryFiles } = useFileIndex();
+  const { files: libraryFiles, addFile } = useFileIndex();
 
   const hasLibraryPdfs = useMemo(
     () => libraryFiles.some((f) => f.extension?.toLowerCase() === "pdf" || f.type?.toLowerCase() === "pdf"),
@@ -165,11 +165,23 @@ export default function QRCodeScreen() {
       const data = await response.json();
       if (!data.downloadUrl) throw new Error("No download URL returned from server");
 
-      const outputUri = `${FileSystem.cacheDirectory}qr_${selectedFile.name}`;
+      const outputDir = `${FileSystem.documentDirectory}pdfiq-outputs/`;
+      await FileSystem.makeDirectoryAsync(outputDir, { intermediates: true });
+      const outputName = `qr_${selectedFile.name}`;
+      const outputUri = `${outputDir}${outputName}`;
       const downloadResult = await FileSystem.downloadAsync(data.downloadUrl, outputUri);
       if (downloadResult.status !== 200) {
         throw new Error(`Download failed with status ${downloadResult.status}`);
       }
+
+      await addFile({
+        uri: outputUri,
+        name: outputName,
+        type: "pdf",
+        extension: "pdf",
+        mimeType: "application/pdf",
+        source: "created",
+      });
 
       setResultUri(outputUri);
       setDone(true);

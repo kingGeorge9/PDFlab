@@ -7,12 +7,22 @@
  */
 
 const fs = require("fs");
+const path = require("path");
+const { pathToFileURL } = require("url");
 
 let _pdfjsLib = null;
 
 async function getPdfjsLib() {
   if (!_pdfjsLib) {
     _pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    // pdfjs-dist 4.x on Windows requires a file:// URL, not a raw path.
+    const workerPath = path.join(
+      path.dirname(require.resolve("pdfjs-dist/package.json")),
+      "legacy",
+      "build",
+      "pdf.worker.mjs",
+    );
+    _pdfjsLib.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).href;
   }
   return _pdfjsLib;
 }
@@ -85,7 +95,10 @@ async function extractTextWithPositions(source) {
       const x = tx[4];
       const y = tx[5];
       const w = item.width;
-      const h = item.height;
+      // item.height is 0 for many PDFs in pdfjs-dist 4.x (font ascent not reported).
+      // Fall back to the vertical scale from the text rendering matrix (= font size).
+      const transformScale = Math.abs(tx[3]) || Math.abs(tx[0]);
+      const h = item.height > 0 ? item.height : (transformScale || 12);
 
       items.push({
         text: item.str,

@@ -1,4 +1,4 @@
-const { PDFDocument, rgb, degrees } = require("pdf-lib");
+const { PDFDocument, rgb, degrees, PDFName, PDFArray, PDFString, PDFStream } = require("pdf-lib");
 const fs = require("fs").promises;
 const path = require("path");
 const crypto = require("crypto");
@@ -235,23 +235,71 @@ class PDFService {
     return Buffer.from(numberedPdfBytes);
   }
 
-  // Compress PDF (basic optimization)
-  // Compress PDF with quality options
+  // Compress PDF with real image recompression + structural optimization
   async compressPDF(file, quality = "medium") {
-    const pdfBytes = await fs.readFile(file.tempFilePath);
-    const pdf = await PDFDocument.load(pdfBytes);
+    const LEVELS = {
+      low:    { jpegQuality: 85, scale: 1.0 },
+      medium: { jpegQuality: 65, scale: 0.85 },
+      high:   { jpegQuality: 45, scale: 0.7 },
+    };
+    const level = LEVELS[quality] || LEVELS.medium;
 
-    // Compression options based on quality
-    const compressionOptions = {
+    const pdfBytes = await fs.readFile(file.tempFilePath);
+    const pdf = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+
+    // 1. Strip metadata
+    pdf.setTitle("");
+    pdf.setAuthor("");
+    pdf.setSubject("");
+    pdf.setKeywords([]);
+    pdf.setCreator("PDFiQ");
+    pdf.setProducer("PDFiQ");
+
+    // 2. Re-compress embedded JPEG images
+    const context = pdf.context;
+    let imagesProcessed = 0;
+    for (const [, obj] of context.enumerateIndirectObjects()) {
+      if (!(obj instanceof PDFStream)) continue;
+
+      const dict = obj.dict;
+      const subtype = dict.lookupMaybe(PDFName.of("Subtype"), PDFName);
+      const filter = dict.lookupMaybe(PDFName.of("Filter"), PDFName);
+
+      if (subtype?.toString() !== "/Image") continue;
+      if (!filter || filter.toString() !== "/DCTDecode") continue;
+
+      const width = dict.lookupMaybe(PDFName.of("Width"))?.asNumber() || 0;
+      const height = dict.lookupMaybe(PDFName.of("Height"))?.asNumber() || 0;
+      if (!width || !height) continue;
+
+      try {
+        const imgData = obj.getContents();
+        const newW = Math.max(1, Math.round(width * level.scale));
+        const newH = Math.max(1, Math.round(height * level.scale));
+
+        const recompressed = await sharp(imgData)
+          .resize(newW, newH)
+          .jpeg({ quality: level.jpegQuality, mozjpeg: true })
+          .toBuffer();
+
+        if (recompressed.length < imgData.length) {
+          obj.setContents(recompressed);
+          dict.set(PDFName.of("Width"), context.obj(newW));
+          dict.set(PDFName.of("Height"), context.obj(newH));
+          imagesProcessed++;
+        }
+      } catch {
+        // Skip images that can't be re-encoded
+      }
+    }
+
+    // 3. Save with structural compression
+    const compressedPdfBytes = await pdf.save({
       useObjectStreams: true,
       addDefaultPage: false,
-    };
+      objectsPerTick: 50,
+    });
 
-    // For more aggressive compression, we'd need Ghostscript or qpdf
-    // This provides structural optimization via pdf-lib
-    const compressedPdfBytes = await pdf.save(compressionOptions);
-
-    // Report compression stats
     const originalSize = pdfBytes.length;
     const compressedSize = compressedPdfBytes.length;
     const savings = (
@@ -260,7 +308,7 @@ class PDFService {
     ).toFixed(1);
 
     console.log(
-      `Compression: ${originalSize} -> ${compressedSize} bytes (${savings}% reduction)`,
+      `Compression: ${originalSize} -> ${compressedSize} bytes (${savings}% reduction, ${imagesProcessed} images recompressed)`,
     );
 
     return Buffer.from(compressedPdfBytes);
@@ -269,17 +317,109 @@ class PDFService {
   // Get PDF info
   async getPDFInfo(file) {
     const pdfBytes = await fs.readFile(file.tempFilePath);
-    const pdf = await PDFDocument.load(pdfBytes);
+    const pdf = await PDFDocument.load(pdfBytes, {
+      ignoreEncryption: true,
+      throwOnInvalidObject: false,
+    });
+
+    const pages = pdf.getPages();
+    const firstPage = pages[0];
+    const { width: pageWidth, height: pageHeight } = firstPage
+      ? firstPage.getSize()
+      : { width: 0, height: 0 };
+    const rotation = firstPage ? firstPage.getRotation().angle : 0;
+
+    // PDF version from the header bytes
+    let pdfVersion = "unknown";
+    try {
+      const header = pdfBytes.slice(0, 10).toString("utf8");
+      const m = header.match(/%PDF-(\d+\.\d+)/);
+      if (m) pdfVersion = m[1];
+    } catch {}
+
+    // Encryption check: scan last 1 KB of the PDF for /Encrypt in trailer
+    let isEncrypted = false;
+    try {
+      isEncrypted = pdfBytes.slice(-1024).toString("latin1").includes("/Encrypt");
+    } catch {}
+
+    // Form fields
+    let hasForm = false;
+    let formFieldCount = 0;
+    try {
+      const form = pdf.getForm();
+      const fields = form.getFields();
+      formFieldCount = fields.length;
+      hasForm = formFieldCount > 0;
+    } catch {}
+
+    // Count images, fonts, and check for embedded files via object enumeration
+    let imageCount = 0;
+    let hasEmbeddedFiles = false;
+    const fontNames = new Set();
+    try {
+      for (const [, obj] of pdf.context.enumerateIndirectObjects()) {
+        if (!obj || typeof obj !== "object" || !obj.dict) continue;
+
+        const typeVal = obj.dict.lookup?.(PDFName.of("Type"));
+        const typeStr = typeVal?.toString() || "";
+
+        if (obj.contents instanceof Uint8Array) {
+          const sub = obj.dict.lookup?.(PDFName.of("Subtype"));
+          if (sub?.toString() === "/Image") imageCount++;
+        }
+
+        if (typeStr === "/Font") {
+          const baseName = obj.dict.lookup?.(PDFName.of("BaseFont"));
+          if (baseName) fontNames.add(baseName.toString().replace(/^\//, ""));
+        }
+
+        if (typeStr === "/Filespec" || typeStr === "/EmbeddedFile") {
+          hasEmbeddedFiles = true;
+        }
+      }
+    } catch {}
+
+    // Count annotations across all pages
+    let annotationCount = 0;
+    try {
+      for (const page of pages) {
+        const annots = page.node.lookup(PDFName.of("Annots"));
+        if (annots instanceof PDFArray) {
+          annotationCount += annots.size();
+        }
+      }
+    } catch {}
+
+    const fontCount = fontNames.size;
 
     return {
       pageCount: pdf.getPageCount(),
-      title: pdf.getTitle(),
-      author: pdf.getAuthor(),
-      subject: pdf.getSubject(),
-      creator: pdf.getCreator(),
-      producer: pdf.getProducer(),
-      creationDate: pdf.getCreationDate(),
-      modificationDate: pdf.getModificationDate(),
+      fileSize: file.size || pdfBytes.length,
+      pdfVersion,
+      pageWidth: Math.round(pageWidth),
+      pageHeight: Math.round(pageHeight),
+      pageRotation: rotation !== 0 ? rotation : undefined,
+      title: pdf.getTitle() || null,
+      author: pdf.getAuthor() || null,
+      subject: pdf.getSubject() || null,
+      keywords: pdf.getKeywords() || null,
+      creator: pdf.getCreator() || null,
+      producer: pdf.getProducer() || null,
+      creationDate: pdf.getCreationDate()
+        ? pdf.getCreationDate().toISOString()
+        : null,
+      modificationDate: pdf.getModificationDate()
+        ? pdf.getModificationDate().toISOString()
+        : null,
+      isEncrypted,
+      hasForm,
+      formFieldCount: hasForm ? formFieldCount : undefined,
+      hasEmbeddedFiles,
+      imageCount: imageCount > 0 ? imageCount : undefined,
+      fontCount: fontCount > 0 ? fontCount : undefined,
+      fontNames: fontCount > 0 ? Array.from(fontNames).slice(0, 10) : undefined,
+      annotationCount: annotationCount > 0 ? annotationCount : undefined,
     };
   }
 
@@ -355,18 +495,97 @@ class PDFService {
     return Buffer.from(repairedBytes);
   }
 
-  // Optimize images in PDF
+  // Optimize images in PDF — real image recompression via sharp
   async optimizeImagesPDF(file, quality = 80) {
-    const pdfBytes = await fs.readFile(file.tempFilePath);
-    const pdf = await PDFDocument.load(pdfBytes);
+    // Map quality number (0-100) to a descriptive level for scaling
+    // quality 80+ = high quality (no downscale), 50-79 = medium, <50 = aggressive
+    const scale = quality >= 80 ? 1.0 : quality >= 50 ? 0.85 : 0.7;
+    const jpegQuality = Math.max(20, Math.min(95, quality));
 
-    // Get all embedded images and attempt to optimize them
-    // Note: Full image extraction/replacement requires complex stream parsing
-    // This implementation focuses on structural optimization
+    const pdfBytes = await fs.readFile(file.tempFilePath);
+    const pdf = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+
+    const context = pdf.context;
+    let imagesOptimized = 0;
+    let totalSaved = 0;
+
+    for (const [, obj] of context.enumerateIndirectObjects()) {
+      if (!(obj instanceof PDFStream)) continue;
+
+      const dict = obj.dict;
+      const subtype = dict.lookupMaybe(PDFName.of("Subtype"), PDFName);
+      if (subtype?.toString() !== "/Image") continue;
+
+      const filter = dict.lookupMaybe(PDFName.of("Filter"), PDFName);
+      const filterStr = filter?.toString() || "";
+      const width = dict.lookupMaybe(PDFName.of("Width"))?.asNumber() || 0;
+      const height = dict.lookupMaybe(PDFName.of("Height"))?.asNumber() || 0;
+      if (!width || !height) continue;
+
+      try {
+        const imgData = obj.getContents();
+        const newW = Math.max(1, Math.round(width * scale));
+        const newH = Math.max(1, Math.round(height * scale));
+
+        let recompressed;
+        if (filterStr === "/DCTDecode") {
+          // JPEG image — recompress as JPEG
+          recompressed = await sharp(imgData)
+            .resize(newW, newH)
+            .jpeg({ quality: jpegQuality, mozjpeg: true })
+            .toBuffer();
+        } else if (filterStr === "/FlateDecode") {
+          // PNG-like image (raw pixels compressed with Flate)
+          // Read the color space and bits per component to reconstruct raw image
+          const bpc = dict.lookupMaybe(PDFName.of("BitsPerComponent"))?.asNumber() || 8;
+          const cs = dict.lookupMaybe(PDFName.of("ColorSpace"), PDFName)?.toString() || "";
+          let channels = 3; // default RGB
+          if (cs === "/DeviceGray") channels = 1;
+          else if (cs === "/DeviceCMYK") channels = 4;
+
+          const expectedSize = width * height * channels * (bpc / 8);
+          if (imgData.length < expectedSize * 0.5) continue; // Not raw pixel data
+
+          // Try to interpret as raw pixels and recompress as JPEG
+          recompressed = await sharp(imgData, {
+            raw: { width, height, channels },
+          })
+            .resize(newW, newH)
+            .jpeg({ quality: jpegQuality, mozjpeg: true })
+            .toBuffer();
+
+          // Switch filter to DCTDecode since we're now JPEG
+          if (recompressed.length < imgData.length) {
+            dict.set(PDFName.of("Filter"), PDFName.of("DCTDecode"));
+            dict.set(PDFName.of("ColorSpace"), PDFName.of(channels === 1 ? "DeviceGray" : "DeviceRGB"));
+            dict.set(PDFName.of("BitsPerComponent"), context.obj(8));
+          }
+        } else {
+          continue; // Skip unsupported filters
+        }
+
+        if (recompressed && recompressed.length < imgData.length) {
+          const saved = imgData.length - recompressed.length;
+          totalSaved += saved;
+          obj.setContents(recompressed);
+          dict.set(PDFName.of("Width"), context.obj(newW));
+          dict.set(PDFName.of("Height"), context.obj(newH));
+          imagesOptimized++;
+        }
+      } catch {
+        // Skip images that can't be processed
+      }
+    }
+
     const optimizedBytes = await pdf.save({
       useObjectStreams: true,
       addDefaultPage: false,
+      objectsPerTick: 50,
     });
+
+    console.log(
+      `[OptimizeImages] ${imagesOptimized} images optimized, ~${(totalSaved / 1024).toFixed(0)}KB saved from images, output: ${optimizedBytes.length} bytes`,
+    );
 
     return Buffer.from(optimizedBytes);
   }
@@ -658,7 +877,11 @@ class PDFService {
     const pages = pdf.getPages();
 
     pages.forEach((page) => {
-      page.setSize(width, height);
+      const { width: origW, height: origH } = page.getSize();
+      const scaleX = width / origW;
+      const scaleY = height / origH;
+      // Scale content to fit new page dimensions
+      page.scale(scaleX, scaleY);
     });
 
     const resizedBytes = await pdf.save();
@@ -980,94 +1203,39 @@ class PDFService {
     return validation;
   }
 
-  // Create form - with optional blank PDF generation
-  async createFormPDF(file, fields) {
-    let pdf;
-    if (file) {
-      const pdfBytes = await fs.readFile(file.tempFilePath);
-      pdf = await PDFDocument.load(pdfBytes);
-    } else {
-      // Create a blank A4 PDF
-      pdf = await PDFDocument.create();
-      pdf.addPage([595.28, 841.89]); // A4
-    }
-
-    const form = pdf.getForm();
-    const pages = pdf.getPages();
-    const page = pages[0];
-    const { width } = page.getSize();
-
-    let yOffset = page.getSize().height - 60; // Start from top with margin
-    const fieldHeight = 24;
-    const fieldSpacing = 16;
-    const labelHeight = 14;
-    const leftMargin = 50;
-    const fieldWidth = Math.min(width - 100, 400);
-
-    const font = await pdf.embedFont("Helvetica");
-
-    fields.forEach((field) => {
-      // Check if we need a new page
-      if (yOffset < 60) {
-        const newPage = pdf.addPage([595.28, 841.89]);
-        yOffset = newPage.getSize().height - 60;
-      }
-
-      // Draw field label
-      page.drawText(field.name + (field.type === "checkbox" ? "" : ":"), {
-        x: leftMargin,
-        y: yOffset + fieldHeight + 2,
-        size: 11,
-        font,
-        color: rgb(0.2, 0.2, 0.2),
-      });
-
-      if (field.type === "text") {
-        const textField = form.createTextField(field.name);
-        textField.addToPage(page, {
-          x: leftMargin,
-          y: yOffset,
-          width: fieldWidth,
-          height: fieldHeight,
-          borderWidth: 1,
-          borderColor: rgb(0.7, 0.7, 0.7),
-        });
-        textField.setText("");
-      } else if (field.type === "checkbox") {
-        const checkbox = form.createCheckBox(field.name);
-        checkbox.addToPage(page, {
-          x: leftMargin,
-          y: yOffset,
-          width: 18,
-          height: 18,
-          borderWidth: 1,
-          borderColor: rgb(0.7, 0.7, 0.7),
-        });
-      }
-
-      yOffset -= fieldHeight + labelHeight + fieldSpacing;
-    });
-
-    const formBytes = await pdf.save();
-    return Buffer.from(formBytes);
-  }
-
-  // Fill form
+  // Fill form — handles text, checkbox, radio, dropdown, and listbox fields
   async fillFormPDF(file, data) {
     const pdfBytes = await fs.readFile(file.tempFilePath);
     const pdf = await PDFDocument.load(pdfBytes);
     const form = pdf.getForm();
 
-    Object.keys(data).forEach((key) => {
+    for (const [key, value] of Object.entries(data)) {
       try {
         const field = form.getField(key);
-        if (field) {
-          field.setText ? field.setText(data[key]) : null;
+        if (!field) continue;
+
+        const constructor = field.constructor?.name || "";
+
+        if (constructor.includes("CheckBox") || constructor.includes("Checkbox")) {
+          if (value === "true" || value === "yes" || value === "1") {
+            field.check();
+          } else {
+            field.uncheck();
+          }
+        } else if (constructor.includes("RadioGroup") || constructor.includes("Radio")) {
+          if (typeof field.select === "function") field.select(value);
+        } else if (constructor.includes("Dropdown") || constructor.includes("ComboBox")) {
+          if (typeof field.select === "function") field.select(value);
+        } else if (constructor.includes("OptionList") || constructor.includes("ListBox")) {
+          if (typeof field.select === "function") field.select([value]);
+        } else {
+          // Text field
+          if (typeof field.setText === "function") field.setText(value);
         }
-      } catch (error) {
-        console.log(`Field ${key} not found`);
+      } catch (err) {
+        console.warn(`[fillForm] Could not set field "${key}":`, err.message);
       }
-    });
+    }
 
     const filledBytes = await pdf.save();
     return Buffer.from(filledBytes);
@@ -1085,25 +1253,51 @@ class PDFService {
     return Buffer.from(flattenedBytes);
   }
 
-  // Extract form data
+  // Extract form data with field types
   async extractFormDataPDF(file) {
     const pdfBytes = await fs.readFile(file.tempFilePath);
     const pdf = await PDFDocument.load(pdfBytes);
     const form = pdf.getForm();
 
     const fields = form.getFields();
-    const formData = {};
+    const formFields = [];
 
     fields.forEach((field) => {
       const name = field.getName();
+      const constructor = field.constructor?.name || "";
+      let type = "text";
+      let value = "";
+      let options = undefined;
+
       try {
-        formData[name] = field.getText ? field.getText() : "N/A";
-      } catch (error) {
-        formData[name] = "Unable to extract";
+        if (constructor.includes("CheckBox") || constructor.includes("Checkbox")) {
+          type = "checkbox";
+          value = field.isChecked?.() ? "true" : "false";
+        } else if (constructor.includes("RadioGroup") || constructor.includes("Radio")) {
+          type = "radio";
+          value = field.getSelected?.() || "";
+          try { options = field.getOptions?.(); } catch {}
+        } else if (constructor.includes("Dropdown") || constructor.includes("ComboBox")) {
+          type = "dropdown";
+          value = field.getSelected?.()?.join(", ") || "";
+          try { options = field.getOptions?.(); } catch {}
+        } else if (constructor.includes("OptionList") || constructor.includes("ListBox")) {
+          type = "listbox";
+          value = field.getSelected?.()?.join(", ") || "";
+          try { options = field.getOptions?.(); } catch {}
+        } else {
+          type = "text";
+          value = field.getText?.() || "";
+        }
+      } catch {
+        type = "text";
+        value = "";
       }
+
+      formFields.push({ name, type, value: value === "N/A" ? "" : value, options });
     });
 
-    return formData;
+    return { fields: formFields, count: formFields.length };
   }
 
   // Compare PDFs - Create side-by-side comparison document
@@ -1147,103 +1341,345 @@ class PDFService {
     return Buffer.from(comparisonBytes);
   }
 
-  // Get differences - Detailed text comparison
+  // Get differences - Per-page text comparison with line-level diff
   async diffPDFs(file1, file2) {
-    const dataBuffer1 = await fs.readFile(file1.tempFilePath);
-    const dataBuffer2 = await fs.readFile(file2.tempFilePath);
+    const { extractTextWithPositions } = require("../utils/pdfTextExtractor");
 
-    const data1 = await pdfParse(dataBuffer1);
-    const data2 = await pdfParse(dataBuffer2);
+    const buf1 = await fs.readFile(file1.tempFilePath);
+    const buf2 = await fs.readFile(file2.tempFilePath);
 
-    // Simple word-level diff
-    const words1 = data1.text.split(/\s+/).filter((w) => w.length > 0);
-    const words2 = data2.text.split(/\s+/).filter((w) => w.length > 0);
+    // Extract text per page using pdfjs-dist (reliable, no module format issues)
+    const [result1, result2] = await Promise.all([
+      extractTextWithPositions(buf1),
+      extractTextWithPositions(buf2),
+    ]);
 
+    const pages1 = result1.pages;
+    const pages2 = result2.pages;
+
+    // Build per-page text arrays
+    const text1PerPage = pages1.map((p) =>
+      p.items.map((it) => it.text).join(" ").trim()
+    );
+    const text2PerPage = pages2.map((p) =>
+      p.items.map((it) => it.text).join(" ").trim()
+    );
+
+    const fullText1 = text1PerPage.join("\n");
+    const fullText2 = text2PerPage.join("\n");
+
+    const words1 = fullText1.split(/\s+/).filter((w) => w.length > 0);
+    const words2 = fullText2.split(/\s+/).filter((w) => w.length > 0);
     const set1 = new Set(words1);
     const set2 = new Set(words2);
+    const commonSet = new Set([...set1].filter((w) => set2.has(w)));
 
-    const onlyInPdf1 = words1.filter((w) => !set2.has(w));
-    const onlyInPdf2 = words2.filter((w) => !set1.has(w));
-    const commonWords = words1.filter((w) => set2.has(w));
+    // Per-page diff: compare corresponding pages
+    const maxPages = Math.max(pages1.length, pages2.length);
+    const pageDiffs = [];
+    for (let i = 0; i < maxPages; i++) {
+      const t1 = text1PerPage[i] || "";
+      const t2 = text2PerPage[i] || "";
+
+      if (t1 === t2) {
+        pageDiffs.push({ page: i + 1, status: "identical" });
+      } else {
+        // Find lines unique to each version
+        const lines1 = t1.split(/[.\n]+/).map((s) => s.trim()).filter(Boolean);
+        const lines2 = t2.split(/[.\n]+/).map((s) => s.trim()).filter(Boolean);
+        const lineSet1 = new Set(lines1);
+        const lineSet2 = new Set(lines2);
+        const removed = lines1.filter((l) => !lineSet2.has(l)).slice(0, 20);
+        const added = lines2.filter((l) => !lineSet1.has(l)).slice(0, 20);
+
+        pageDiffs.push({
+          page: i + 1,
+          status: "changed",
+          removed,
+          added,
+        });
+      }
+    }
 
     return {
       summary: {
         pdf1: {
-          pageCount: data1.numpages,
+          pageCount: pages1.length,
           wordCount: words1.length,
-          charCount: data1.text.length,
+          charCount: fullText1.length,
         },
         pdf2: {
-          pageCount: data2.numpages,
+          pageCount: pages2.length,
           wordCount: words2.length,
-          charCount: data2.text.length,
+          charCount: fullText2.length,
         },
       },
       differences: {
-        onlyInPdf1: [...new Set(onlyInPdf1)].slice(0, 100),
-        onlyInPdf2: [...new Set(onlyInPdf2)].slice(0, 100),
-        commonWordsCount: new Set(commonWords).size,
+        onlyInPdf1: [...new Set(words1.filter((w) => !set2.has(w)))].slice(0, 100),
+        onlyInPdf2: [...new Set(words2.filter((w) => !set1.has(w)))].slice(0, 100),
+        commonWordsCount: commonSet.size,
         similarityScore:
-          (
-            (new Set(commonWords).size / Math.max(set1.size, set2.size)) *
-            100
-          ).toFixed(2) + "%",
+          set1.size === 0 && set2.size === 0
+            ? "100.00%"
+            : ((commonSet.size / Math.max(set1.size, set2.size)) * 100).toFixed(2) + "%",
+        pageDiffs,
       },
     };
   }
 
-  // Merge with review - Combine annotations from multiple PDFs
+  // Merge with review - Copy annotations from file2 onto matching pages of file1
   async mergeReviewPDFs(file1, file2) {
-    return this.mergePDFs([file1, file2]);
+    const pdfBytes1 = await fs.readFile(file1.tempFilePath);
+    const pdfBytes2 = await fs.readFile(file2.tempFilePath);
+
+    const basePdf = await PDFDocument.load(pdfBytes1, { ignoreEncryption: true });
+    const reviewPdf = await PDFDocument.load(pdfBytes2, { ignoreEncryption: true });
+
+    const basePages = basePdf.getPages();
+    const reviewPages = reviewPdf.getPages();
+    const context = basePdf.context;
+
+    // For each page in the review PDF, extract annotations and copy to base
+    const maxPages = Math.min(basePages.length, reviewPages.length);
+    let annotsCopied = 0;
+
+    for (let i = 0; i < maxPages; i++) {
+      const reviewPageNode = reviewPages[i].node;
+      const basePageNode = basePages[i].node;
+
+      // Get annotations from review page
+      let reviewAnnots;
+      try {
+        reviewAnnots = reviewPageNode.lookup?.(PDFName.of("Annots"))
+          || reviewPageNode.get?.(PDFName.of("Annots"));
+      } catch { continue; }
+
+      if (!reviewAnnots) continue;
+
+      // Get or create annotations array on base page
+      let baseAnnots;
+      try {
+        baseAnnots = basePageNode.lookup?.(PDFName.of("Annots"))
+          || basePageNode.get?.(PDFName.of("Annots"));
+      } catch { /* no existing annots */ }
+
+      if (!(baseAnnots instanceof PDFArray)) {
+        baseAnnots = context.obj([]);
+        basePageNode.set(PDFName.of("Annots"), baseAnnots);
+      }
+
+      // Copy each annotation from review to base
+      const annotsArray = reviewAnnots instanceof PDFArray ? reviewAnnots : null;
+      if (!annotsArray) continue;
+
+      for (let j = 0; j < annotsArray.size(); j++) {
+        try {
+          const annotRef = annotsArray.get(j);
+          const annotObj = reviewPdf.context.lookup(annotRef);
+          if (!annotObj) continue;
+
+          // Serialize and re-register in base context
+          // Use copyPages trick: copy a temporary page to bring objects over
+          const annotDict = annotObj.dict || annotObj;
+
+          // Check if it's a meaningful annotation (not just Link)
+          let subtypeVal;
+          try {
+            subtypeVal = annotDict.lookup?.(PDFName.of("Subtype"))
+              || annotDict.get?.(PDFName.of("Subtype"));
+          } catch { /* skip */ }
+
+          const subtypeStr = subtypeVal?.toString?.() || "";
+          // Copy all annotation types: Text, Highlight, StrikeOut, Underline,
+          // FreeText, Stamp, Ink, Square, Circle, Polygon, Caret, etc.
+
+          // Re-create annotation in base context
+          const newAnnotDict = context.obj({});
+          const entries = annotDict.entries?.() || [];
+          for (const [key, val] of entries) {
+            try {
+              // Skip the P (page) reference since it points to review PDF
+              if (key.toString() === "/P") continue;
+              newAnnotDict.set(key, val);
+            } catch { /* skip non-copyable entries */ }
+          }
+
+          const newAnnotRef = context.register(newAnnotDict);
+          baseAnnots.push(newAnnotRef);
+          annotsCopied++;
+        } catch { /* skip problematic annotation */ }
+      }
+    }
+
+    // If review PDF has extra pages beyond base, append them
+    if (reviewPages.length > basePages.length) {
+      const extraIndices = [];
+      for (let i = basePages.length; i < reviewPages.length; i++) {
+        extraIndices.push(i);
+      }
+      const extraPages = await basePdf.copyPages(reviewPdf, extraIndices);
+      extraPages.forEach((page) => basePdf.addPage(page));
+    }
+
+    const resultBytes = await basePdf.save();
+    return Buffer.from(resultBytes);
   }
 
-  // Convert to black and white using page rendering
+  // Convert to black and white using page rendering.
+  // Strategy 1: pdf2pic (requires GraphicsMagick/ImageMagick) — best quality.
+  // Strategy 2: pdfjs-dist + node-canvas — pure JS fallback.
+  // Strategy 3: pdf-lib image-only grayscale — converts embedded images only.
   async blackWhitePDF(file) {
-    const { fromPath } = require("pdf2pic");
-
     const pdfBytes = await fs.readFile(file.tempFilePath);
-    const pdf = await PDFDocument.load(pdfBytes);
-    const pageCount = pdf.getPageCount();
+    const srcPdf = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+    const pageCount = srcPdf.getPageCount();
 
-    const newPdf = await PDFDocument.create();
+    // ── Strategy 1: pdf2pic full-page rasterization ──────────────────
+    try {
+      const { fromBuffer } = require("pdf2pic");
+      const newPdf = await PDFDocument.create();
+      let allPagesRendered = true;
 
-    // Convert each page to grayscale image and back to PDF
-    const options = {
-      density: 150,
-      saveFilename: `bw_${Date.now()}`,
-      savePath: path.dirname(file.tempFilePath),
-      format: "png",
-      width: 1200,
-      height: 1600,
-    };
+      for (let i = 0; i < pageCount; i++) {
+        const { width: origW, height: origH } = srcPdf.getPage(i).getSize();
+        const dpi = 200;
+        const converter = fromBuffer(Buffer.from(pdfBytes), {
+          density: dpi,
+          format: "png",
+          width: Math.round(origW * dpi / 72),
+          height: Math.round(origH * dpi / 72),
+          preserveAspectRatio: true,
+        });
 
-    const convert = fromPath(file.tempFilePath, options);
+        const result = await converter(i + 1, { responseType: "buffer" });
+        if (!result?.buffer) {
+          allPagesRendered = false;
+          break;
+        }
 
-    for (let i = 1; i <= pageCount; i++) {
-      try {
-        const result = await convert(i, { responseType: "buffer" });
-        const imageBuffer = result.buffer || result;
-
-        // Convert to grayscale
-        const grayscaleBuffer = await sharp(imageBuffer)
+        const grayBuf = await sharp(result.buffer)
           .grayscale()
-          .png()
+          .jpeg({ quality: 90, mozjpeg: true })
           .toBuffer();
 
-        // Embed grayscale image as new page
-        const pngImage = await newPdf.embedPng(grayscaleBuffer);
-        const page = newPdf.addPage([pngImage.width, pngImage.height]);
-        page.drawImage(pngImage, {
-          x: 0,
-          y: 0,
-          width: pngImage.width,
-          height: pngImage.height,
-        });
-      } catch (error) {
-        console.error(`Error converting page ${i} to grayscale:`, error);
-        // Copy original page if conversion fails
-        const [originalPage] = await newPdf.copyPages(pdf, [i - 1]);
-        newPdf.addPage(originalPage);
+        const grayImage = await newPdf.embedJpg(grayBuf);
+        const newPage = newPdf.addPage([origW, origH]);
+        newPage.drawImage(grayImage, { x: 0, y: 0, width: origW, height: origH });
+      }
+
+      if (allPagesRendered) {
+        const bwBytes = await newPdf.save();
+        return Buffer.from(bwBytes);
+      }
+      // If some pages failed, fall through to strategy 2
+    } catch (pdf2picErr) {
+      console.warn("[blackWhitePDF] pdf2pic unavailable, trying pdfjs-dist fallback:", pdf2picErr.message);
+    }
+
+    // ── Strategy 2: pdfjs-dist rendering via node-canvas ─────────────
+    try {
+      const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+      if (pdfjsLib.GlobalWorkerOptions) {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = "";
+      }
+
+      // Try to load node-canvas for pdfjs rendering
+      const { createCanvas } = require("canvas");
+
+      const doc = await pdfjsLib.getDocument({
+        data: new Uint8Array(pdfBytes),
+        useWorkerFetch: false,
+        isEvalSupported: false,
+        useSystemFonts: true,
+        verbosity: 0,
+      }).promise;
+
+      const newPdf = await PDFDocument.create();
+
+      for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        const viewport = page.getViewport({ scale: 200 / 72 }); // 200 DPI
+        const canvas = createCanvas(viewport.width, viewport.height);
+        const ctx = canvas.getContext("2d");
+
+        // White background
+        ctx.fillStyle = "white";
+        ctx.fillRect(0, 0, viewport.width, viewport.height);
+
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        page.cleanup();
+
+        // Get pixel data and convert to grayscale with sharp
+        const pngBuf = canvas.toBuffer("image/png");
+        const grayBuf = await sharp(pngBuf)
+          .grayscale()
+          .jpeg({ quality: 90, mozjpeg: true })
+          .toBuffer();
+
+        const srcPage = srcPdf.getPage(i - 1);
+        const { width: origW, height: origH } = srcPage.getSize();
+        const grayImage = await newPdf.embedJpg(grayBuf);
+        const newPage = newPdf.addPage([origW, origH]);
+        newPage.drawImage(grayImage, { x: 0, y: 0, width: origW, height: origH });
+      }
+
+      await doc.destroy();
+      const bwBytes = await newPdf.save();
+      return Buffer.from(bwBytes);
+    } catch (pdfjsErr) {
+      console.warn("[blackWhitePDF] pdfjs-dist+canvas fallback failed:", pdfjsErr.message);
+    }
+
+    // ── Strategy 3: pdf-lib image-only grayscale ─────────────────────
+    // Converts all embedded images to grayscale using sharp.
+    // Text color is not changed (it stays as-is), but this ensures
+    // all visual image content is grayscale without external dependencies.
+    const newPdf = await PDFDocument.create();
+    const copiedPages = await newPdf.copyPages(srcPdf, srcPdf.getPageIndices());
+
+    for (const page of copiedPages) {
+      newPdf.addPage(page);
+    }
+
+    // Enumerate all indirect objects to find image XObjects
+    for (const [ref, obj] of newPdf.context.enumerateIndirectObjects()) {
+      if (!obj || typeof obj !== "object" || !obj.dict) continue;
+
+      let subtype;
+      try {
+        subtype = obj.dict.lookup?.(PDFName.of("Subtype")) || obj.dict.get?.(PDFName.of("Subtype"));
+      } catch { continue; }
+      if (!subtype || subtype.toString() !== "/Image") continue;
+
+      // Get image bytes
+      let imgBytes = null;
+      if (obj.contents instanceof Uint8Array && obj.contents.length > 0) {
+        imgBytes = obj.contents;
+      } else if (typeof obj.getContents === "function") {
+        try { imgBytes = obj.getContents(); } catch { continue; }
+      }
+      if (!imgBytes || imgBytes.length < 100) continue;
+
+      // Check if it's a JPEG (DCTDecode)
+      let filter;
+      try {
+        filter = obj.dict.lookup?.(PDFName.of("Filter")) || obj.dict.get?.(PDFName.of("Filter"));
+      } catch { continue; }
+      const filterStr = filter?.toString?.() || "";
+
+      if (filterStr.includes("DCTDecode")) {
+        // Convert JPEG to grayscale
+        try {
+          const grayJpeg = await sharp(Buffer.from(imgBytes))
+            .grayscale()
+            .jpeg({ quality: 90 })
+            .toBuffer();
+
+          // Replace the stream contents
+          obj.contents = new Uint8Array(grayJpeg);
+          // Update colorspace to DeviceGray
+          obj.dict.set(PDFName.of("ColorSpace"), PDFName.of("DeviceGray"));
+        } catch { /* skip this image */ }
       }
     }
 
@@ -1251,35 +1687,36 @@ class PDFService {
     return Buffer.from(bwBytes);
   }
 
-  // Fix orientation - Detect and correct page orientation
-  async fixOrientationPDF(file) {
+  // Fix orientation — rotate specific pages or all pages
+  async fixOrientationPDF(file, rotation = 90, pageIndices = null) {
     const pdfBytes = await fs.readFile(file.tempFilePath);
     const pdf = await PDFDocument.load(pdfBytes);
     const pages = pdf.getPages();
 
-    pages.forEach((page) => {
-      const { width, height } = page.getSize();
-      const currentRotation = page.getRotation().angle;
+    const targetIndices = (pageIndices && pageIndices.length > 0)
+      ? pageIndices.filter((i) => i >= 0 && i < pages.length)
+      : pages.map((_, i) => i);
 
-      // If page is landscape (width > height) and has rotation, normalize it
-      if (width > height) {
-        // Landscape page - check if it should be portrait
-        if (currentRotation === 90 || currentRotation === 270) {
-          page.setRotation(degrees(0));
-        }
+    for (const idx of targetIndices) {
+      const page = pages[idx];
+      if (rotation === 0) {
+        // Reset to no rotation
+        page.setRotation(degrees(0));
       } else {
-        // Portrait page - ensure no rotation
-        if (currentRotation !== 0) {
-          page.setRotation(degrees(0));
-        }
+        // Add rotation relative to current
+        const current = page.getRotation().angle || 0;
+        page.setRotation(degrees((current + rotation) % 360));
       }
-    });
+    }
 
-    const fixedBytes = await pdf.save();
-    return Buffer.from(fixedBytes);
+    const resultBytes = await pdf.save();
+    return Buffer.from(resultBytes);
   }
 
-  // Remove blank pages using content analysis
+  // Remove blank pages using multi-signal detection:
+  // 1. Text content (pdf-parse)
+  // 2. XObject references (images/forms in the page)
+  // 3. Visual pixel analysis via pdfjs-dist + sharp (catches scanned blanks)
   async removeBlankPagesPDF(file) {
     const pdfBytes = await fs.readFile(file.tempFilePath);
     const pdf = await PDFDocument.load(pdfBytes);
@@ -1288,26 +1725,114 @@ class PDFService {
     const pageCount = pdf.getPageCount();
     const nonBlankIndices = [];
 
-    // Analyze each page for content
+    // ── Signal 1 & 2: text + XObject checks via pdf-lib ──────────────
+    const textBlankFlags = []; // true if page appears blank from text+xobject
     for (let i = 0; i < pageCount; i++) {
-      const tempPdf = await PDFDocument.create();
-      const [copiedPage] = await tempPdf.copyPages(pdf, [i]);
-      tempPdf.addPage(copiedPage);
-      const singlePageBytes = await tempPdf.save();
+      let hasText = false;
+      let hasXObjects = false;
 
+      // Check XObjects on the page (images, forms, etc.)
       try {
+        const pageNode = pdf.getPage(i).node;
+        const resources = pageNode.lookup?.(PDFName.of("Resources")) || pageNode.get?.(PDFName.of("Resources"));
+        if (resources) {
+          const xobjects = resources.lookup?.(PDFName.of("XObject")) || resources.get?.(PDFName.of("XObject"));
+          if (xobjects) {
+            // If the page references any XObjects, it likely has visual content
+            const entries = xobjects.entries?.() || [];
+            for (const [, val] of entries) {
+              if (val) { hasXObjects = true; break; }
+            }
+          }
+        }
+      } catch {
+        // Ignore XObject check failures
+      }
+
+      // Check text content
+      try {
+        const tempPdf = await PDFDocument.create();
+        const [copiedPage] = await tempPdf.copyPages(pdf, [i]);
+        tempPdf.addPage(copiedPage);
+        const singlePageBytes = await tempPdf.save();
         const pageData = await pdfParse(Buffer.from(singlePageBytes));
         const textContent = pageData.text.trim();
+        // Even a single meaningful character counts as text
+        if (textContent.length > 0) hasText = true;
+      } catch {
+        // If parsing fails, assume non-blank (safe default)
+        hasText = true;
+      }
 
-        // Page is non-blank if it has text content (more than just whitespace)
-        if (textContent.length > 10) {
-          nonBlankIndices.push(i);
-        }
-      } catch (error) {
-        // If parsing fails, keep the page
+      if (hasText || hasXObjects) {
         nonBlankIndices.push(i);
+        textBlankFlags.push(false);
+      } else {
+        textBlankFlags.push(true);
       }
     }
+
+    // ── Signal 3: Visual analysis for pages flagged as blank ─────────
+    // Some scanned PDFs have pages with XObjects (image) that are pure white.
+    // Re-check text-blank pages via pixel analysis.
+    // Also, for pages that had XObjects but no text, verify they aren't
+    // just white scanned blanks.
+    const blankByTextIndices = [];
+    for (let i = 0; i < pageCount; i++) {
+      if (textBlankFlags[i]) blankByTextIndices.push(i);
+    }
+
+    // If no pages were flagged blank by text/xobject, we're done
+    if (blankByTextIndices.length === 0 && nonBlankIndices.length > 0) {
+      // All pages have content — nothing to remove
+      const copiedPages = await newPdf.copyPages(pdf, nonBlankIndices);
+      copiedPages.forEach((page) => newPdf.addPage(page));
+      const resultBytes = await newPdf.save();
+      return Buffer.from(resultBytes);
+    }
+
+    // Use pdf2pic + sharp to render blank-candidate pages and check pixel variance
+    try {
+      const { fromBuffer } = require("pdf2pic");
+      const pdfBuffer = Buffer.from(pdfBytes);
+
+      for (const idx of blankByTextIndices) {
+        try {
+          const converter = fromBuffer(pdfBuffer, {
+            density: 72, // Low DPI is fine for blank detection
+            format: "png",
+            width: 200,  // Small thumbnail is enough
+            height: 280,
+          });
+          const result = await converter(idx + 1, { responseType: "buffer" });
+          if (!result?.buffer) {
+            // Can't render — keep the page (safe default)
+            if (!nonBlankIndices.includes(idx)) nonBlankIndices.push(idx);
+            continue;
+          }
+
+          // Analyze pixel statistics: a blank page has very low std deviation
+          const { channels: sharpChannels } = await sharp(result.buffer).stats();
+          const allChannelStdDev = sharpChannels.reduce((sum, ch) => sum + ch.stdev, 0);
+
+          // Threshold: if combined std deviation across channels is > 5,
+          // the page has meaningful visual content
+          if (allChannelStdDev > 5) {
+            if (!nonBlankIndices.includes(idx)) nonBlankIndices.push(idx);
+          }
+        } catch {
+          // If rendering fails, keep the page (safe default)
+          if (!nonBlankIndices.includes(idx)) nonBlankIndices.push(idx);
+        }
+      }
+    } catch (renderErr) {
+      console.warn("[removeBlankPages] Visual analysis unavailable:", renderErr.message);
+      // If pdf2pic is not available, keep pages that have XObjects
+      // (they might have images even if no text)
+    }
+
+    // Sort indices to maintain page order
+    nonBlankIndices.sort((a, b) => a - b);
 
     // If all pages are blank, keep at least the first one
     if (nonBlankIndices.length === 0 && pageCount > 0) {
@@ -1337,38 +1862,73 @@ class PDFService {
     return Buffer.from(resultBytes);
   }
 
-  // Add hyperlinks with proper link annotations
+  // Add hyperlinks with proper clickable link annotations
   async addHyperlinksPDF(file, links) {
     const pdfBytes = await fs.readFile(file.tempFilePath);
     const pdf = await PDFDocument.load(pdfBytes);
     const pages = pdf.getPages();
+    const context = pdf.context;
 
-    links.forEach((link) => {
-      const page = pages[link.pageNumber || 0];
-      if (page) {
-        const { height } = page.getSize();
-        const displayText = link.text || link.url;
-        const fontSize = link.fontSize || 10;
-        const x = link.x || 50;
-        const y = link.y || 50;
+    for (const link of links) {
+      // Determine which pages to apply to
+      let targetPageIndices = [];
+      if (link.pages && Array.isArray(link.pages) && link.pages.length > 0) {
+        // Apply to specified pages (1-based from frontend → 0-based)
+        targetPageIndices = link.pages.map((p) => p - 1).filter((i) => i >= 0 && i < pages.length);
+      } else {
+        targetPageIndices = [link.pageNumber || 0];
+      }
 
-        // Draw link text with underline style
+      const displayText = link.text || link.url;
+      const fontSize = link.fontSize || 10;
+      const x = link.x || 50;
+      const y = link.y || 50;
+      const linkWidth = displayText.length * fontSize * 0.52;
+      const linkHeight = fontSize + 4;
+
+      for (const pageIdx of targetPageIndices) {
+        const page = pages[pageIdx];
+        if (!page) continue;
+
+        // Draw link text in blue with underline
         page.drawText(displayText, {
-          x: x,
-          y: y,
+          x,
+          y,
           size: fontSize,
           color: rgb(0, 0, 0.8),
         });
 
-        // Draw underline
         page.drawLine({
-          start: { x: x, y: y - 2 },
-          end: { x: x + displayText.length * fontSize * 0.5, y: y - 2 },
+          start: { x, y: y - 2 },
+          end: { x: x + linkWidth, y: y - 2 },
           thickness: 0.5,
           color: rgb(0, 0, 0.8),
         });
+
+        // Create a real PDF link annotation with URI action
+        const aDict = context.obj({ S: "URI" });
+        aDict.set(PDFName.of("URI"), PDFString.of(link.url));
+
+        const annotDict = context.obj({
+          Type: "Annot",
+          Subtype: "Link",
+          Rect: [x, y - 2, x + linkWidth, y + linkHeight],
+          Border: [0, 0, 0],
+        });
+        annotDict.set(PDFName.of("A"), aDict);
+
+        const annotRef = context.register(annotDict);
+
+        // Append to page's Annots array
+        const pageDict = page.node;
+        let annots = pageDict.lookup(PDFName.of("Annots"));
+        if (annots instanceof PDFArray) {
+          annots.push(annotRef);
+        } else {
+          pageDict.set(PDFName.of("Annots"), context.obj([annotRef]));
+        }
       }
-    });
+    }
 
     const linkedBytes = await pdf.save();
     return Buffer.from(linkedBytes);

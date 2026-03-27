@@ -129,10 +129,8 @@ app.use("/api/extract-images", require("./routes/extractImagesRoutes"));
 app.use("/api/batch-compress", require("./routes/batchCompressRoutes"));
 app.use("/api/find-replace", require("./routes/findReplaceRoutes"));
 // extract-tables removed — tool deleted per requirements
-app.use("/api/true-redact", require("./routes/trueRedactRoutes"));
 app.use("/api/qrcode", require("./routes/qrcodeRoutes"));
 app.use("/api/header-footer", require("./routes/headerFooterRoutes"));
-app.use("/api/lock", require("./routes/lockRoutes"));
 app.use("/api/highlight-export", require("./routes/highlightExportRoutes"));
 app.use("/api/citations", require("./routes/citationRoutes"));
 

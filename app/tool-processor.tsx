@@ -1,4 +1,5 @@
 import { API_BASE_URL } from "@/config/api";
+import { LibraryFilePicker, type SelectedFile as LibSelectedFile } from "@/components/LibraryFilePicker";
 import { colors, spacing } from "@/constants/theme";
 import { pickFilesWithResult } from "@/services/document-manager";
 import { notifyProcessingComplete } from "@/services/notificationService";
@@ -15,13 +16,11 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
 import {
-  CreateFormBuilder,
   DefaultResultUI,
   DiffResultUI,
   InfoResultUI,
   SearchResultUI,
   ValidateResultUI,
-  type FormField,
 } from "@/components/ToolResultRenderers";
 import {
   VisualToolEditor,
@@ -96,7 +95,6 @@ const TOOL_TITLES: Record<string, string> = {
   compare: "Compare PDFs",
   "header-footer": "Add Header & Footer",
   resize: "Resize Pages",
-  "create-form": "Create Form",
   "fill-form": "Fill Form",
   "extract-data": "Extract Form Data",
   diff: "Show Differences",
@@ -128,9 +126,7 @@ const TOOL_TITLES: Record<string, string> = {
   "extract-images": "Extract Images",
   "batch-compress": "Batch Compress",
   "find-replace": "Find & Replace",
-  "true-redact": "True Redaction",
   "qr-code": "QR Code",
-  "lock-document": "Lock Document",
   "highlight-export": "Export Highlights",
   "citation-extractor": "Citation Extractor",
 };
@@ -173,7 +169,6 @@ const TOOL_DESCRIPTIONS: Record<string, string> = {
   metadata: "Edit the title, author, subject, and keywords.",
   search: "Search for text within your PDF.",
   validate: "Check your PDF for structural errors.",
-  "create-form": "Add form fields to your PDF.",
   "fill-form": "Fill in form fields of a PDF.",
   "extract-data": "Extract form field data from your PDF.",
   diff: "Compare two PDFs side by side.",
@@ -212,9 +207,7 @@ const TOOL_DESCRIPTIONS: Record<string, string> = {
   "extract-images": "Extract all embedded images from your PDF.",
   "batch-compress": "Compress multiple PDFs at once.",
   "find-replace": "Find and replace text in your PDF.",
-  "true-redact": "Permanently remove sensitive information.",
   "qr-code": "Add QR codes to your PDF pages.",
-  "lock-document": "Set expiry and access control on your document.",
   "highlight-export": "Export annotations and highlights from your PDF.",
   "citation-extractor": "Extract and format academic references.",
 };
@@ -259,6 +252,7 @@ const ROTATION_OPTIONS = [
   { angle: 90, label: "90° Clockwise" },
   { angle: 180, label: "180° (Flip)" },
   { angle: 270, label: "90° Counter-clockwise" },
+  { angle: 0, label: "Reset to Original" },
 ] as const;
 
 const STAMP_OPTIONS = [
@@ -327,6 +321,7 @@ export default function ToolProcessorScreen() {
   });
   const [cropApplyTo, setCropApplyTo] = useState<"all" | "custom">("all");
   const [cropPageInput, setCropPageInput] = useState("");
+  const [cropPreviewPage, setCropPreviewPage] = useState(1);
   // Scroll lock: prevents parent ScrollView from scrolling during crop drag
   const [scrollLocked, setScrollLocked] = useState(false);
   const [noteText, setNoteText] = useState("");
@@ -350,6 +345,10 @@ export default function ToolProcessorScreen() {
   const [annotationY, setAnnotationY] = useState("700");
   const [selectedPositionPreset, setSelectedPositionPreset] = useState("top-left");
 
+  // Find & Replace state
+  const [frSearchText, setFrSearchText] = useState("");
+  const [frReplaceText, setFrReplaceText] = useState("");
+  const [frCaseSensitive, setFrCaseSensitive] = useState(false);
   // Organize pages state
   const [pageOrderInput, setPageOrderInput] = useState("");
   // Resize state
@@ -381,15 +380,9 @@ export default function ToolProcessorScreen() {
   const [redactWidth, setRedactWidth] = useState("100");
   const [redactHeight, setRedactHeight] = useState("20");
   const [selectedRedactPreset, setSelectedRedactPreset] = useState("top-banner");
-  // Create-form state: dynamic list of field definitions
-  const [formTitle, setFormTitle] = useState("");
-  const [formDescription, setFormDescription] = useState("");
-  const [formFields, setFormFields] = useState<FormField[]>([
-    { name: "", type: "text" },
-  ]);
   // Fill-form state: extracted field names + user-entered values
   const [fillFormFields, setFillFormFields] = useState<
-    Array<{ name: string; value: string }>
+    Array<{ name: string; value: string; type?: string; options?: string[] }>
   >([]);
   const [fillFormLoading, setFillFormLoading] = useState(false);
   const [fillFormLoaded, setFillFormLoaded] = useState(false);
@@ -397,6 +390,8 @@ export default function ToolProcessorScreen() {
   const [attachmentFiles, setAttachmentFiles] = useState<
     Array<{ uri: string; name: string; mimeType: string }>
   >([]);
+  const [showAttachSourcePicker, setShowAttachSourcePicker] = useState(false);
+  const [showAttachLibraryPicker, setShowAttachLibraryPicker] = useState(false);
 
   // Visual placement state for tools that support tap-to-place
   const VISUAL_TOOLS = new Set(["add-text", "annotate", "redact", "add-stamps", "hyperlinks"]);
@@ -485,24 +480,24 @@ export default function ToolProcessorScreen() {
         () => {},
       );
       if (result.success && result.jsonData) {
-        const formData = result.jsonData.formData || result.jsonData;
-        const fieldNames = Object.keys(formData);
-        if (fieldNames.length > 0) {
+        const data = result.jsonData;
+        // New API returns { fields: [{name, type, value, options}], count }
+        const fields: Array<{ name: string; type?: string; value?: string; options?: string[] }> =
+          data.fields || [];
+        if (fields.length > 0) {
           setFillFormFields(
-            fieldNames.map((name) => ({
-              name,
-              value: String(
-                formData[name] === "N/A" ? "" : formData[name] || "",
-              ),
+            fields.map((f) => ({
+              name: f.name,
+              type: f.type || "text",
+              value: f.value || "",
+              options: f.options,
             })),
           );
         } else {
-          // No fields found — let user add manually
-          setFillFormFields([{ name: "", value: "" }]);
+          setFillFormFields([{ name: "", value: "", type: "text" }]);
         }
       } else {
-        // Could not extract — let user manually add field names
-        setFillFormFields([{ name: "", value: "" }]);
+        setFillFormFields([{ name: "", value: "", type: "text" }]);
       }
     } catch (e) {
       console.warn("Failed to extract form fields:", e);
@@ -520,17 +515,18 @@ export default function ToolProcessorScreen() {
     }
   }, [tool, fileUri]);
 
-  // Pick attachment files
-  const handlePickAttachments = async () => {
+  // Pick attachment files from device
+  const handlePickAttachmentsFromDevice = async () => {
+    setShowAttachSourcePicker(false);
     try {
-      const result = await pickFilesWithResult({
+      const res = await pickFilesWithResult({
         types: ["*/*"],
         multiple: true,
         copyToCacheDirectory: true,
         showAlerts: true,
       });
-      if (!result.cancelled && result.success && result.files.length > 0) {
-        const newFiles = result.files.map((f: any) => ({
+      if (!res.cancelled && res.success && res.files.length > 0) {
+        const newFiles = res.files.map((f: any) => ({
           uri: f.uri,
           name: f.name,
           mimeType: f.mimeType || "application/octet-stream",
@@ -538,8 +534,45 @@ export default function ToolProcessorScreen() {
         setAttachmentFiles((prev) => [...prev, ...newFiles]);
       }
     } catch (e) {
-      console.warn("Attachment picker error:", e);
+      console.warn("Attachment device picker error:", e);
     }
+  };
+
+  // Pick attachment files from app library
+  const handlePickAttachmentsFromLibrary = () => {
+    setShowAttachSourcePicker(false);
+    setShowAttachLibraryPicker(true);
+  };
+
+  // Handle library file selection for attachments
+  const handleAttachLibrarySelect = useCallback((selected: LibSelectedFile[]) => {
+    setShowAttachLibraryPicker(false);
+    if (selected.length === 0) return;
+    const newFiles = selected.map((f) => ({
+      uri: f.uri,
+      name: f.name,
+      mimeType: f.mimeType || "application/octet-stream",
+    }));
+    setAttachmentFiles((prev) => [...prev, ...newFiles]);
+  }, []);
+
+  // Show a simple action-sheet-style source picker
+  const handlePickAttachments = () => {
+    Alert.alert(
+      "Add Attachment",
+      "Where would you like to pick files from?",
+      [
+        {
+          text: "From Device",
+          onPress: handlePickAttachmentsFromDevice,
+        },
+        {
+          text: "From App Library",
+          onPress: handlePickAttachmentsFromLibrary,
+        },
+        { text: "Cancel", style: "cancel" },
+      ],
+    );
   };
 
   const handleProgress = useCallback(
@@ -688,17 +721,6 @@ export default function ToolProcessorScreen() {
       return;
     }
 
-    if (tool === "create-form") {
-      const validFields = formFields.filter((f) => f.name.trim());
-      if (validFields.length === 0) {
-        Alert.alert(
-          "Input Required",
-          "Please add at least one form field with a name.",
-        );
-        return;
-      }
-    }
-
     if (tool === "fill-form") {
       const hasValues = fillFormFields.some(
         (f) => f.name.trim() && f.value.trim(),
@@ -786,16 +808,33 @@ export default function ToolProcessorScreen() {
       const params: Record<string, any> = {};
 
       switch (tool) {
-        case "split":
-          // Backend expects pageRanges: [[0,1,2], [3,4,5]]
-          // We treat each user-entered page as a separate split part
-          const splitPages = parsePageInput(pageInput);
-          if (splitPages.length > 0) {
-            // Convert 1-based page input to 0-based indices
-            // and create one range per selected page set
-            params.pageRanges = [splitPages.map((p) => p - 1)];
+        case "split": {
+          // User enters split points (page numbers where the PDF should be divided).
+          // E.g. for a 10-page PDF, entering "3, 7" means:
+          //   Part 1: pages 1-3, Part 2: pages 4-7, Part 3: pages 8-10
+          const splitPoints = parsePageInput(pageInput).sort((a, b) => a - b);
+          if (splitPoints.length > 0) {
+            const ranges: number[][] = [];
+            let start = 0; // 0-based page index
+            for (const point of splitPoints) {
+              const end = point - 1; // convert 1-based to 0-based inclusive
+              if (end >= start) {
+                const range: number[] = [];
+                for (let p = start; p <= end; p++) range.push(p);
+                ranges.push(range);
+                start = end + 1;
+              }
+            }
+            // Remaining pages after last split point go into the final part
+            // (handled by backend if needed, but we signal with a marker)
+            // We'll add remaining pages as a final range — need total page count
+            // Since we don't know total pages here, push -1 as sentinel
+            // Actually, just add split points and let backend handle remainder
+            params.pageRanges = ranges;
+            params.splitAfterLastPoint = true; // tell backend to include remaining pages
           }
           break;
+        }
         case "remove":
         case "extract":
           params.pages = parsePageInput(pageInput);
@@ -810,6 +849,12 @@ export default function ToolProcessorScreen() {
         case "rotate":
           params.rotation = rotation;
           break;
+        case "fix-orientation":
+          params.rotation = rotation;
+          if (pageInput.trim()) {
+            params.pages = parsePageInput(pageInput);
+          }
+          break;
         case "watermark":
           if (watermarkText.trim()) {
             params.text = watermarkText;
@@ -820,6 +865,12 @@ export default function ToolProcessorScreen() {
         case "compress":
           params.quality = compressionQuality;
           break;
+        case "optimize-images": {
+          // Map compression quality to image quality percentage
+          const qualityMap = { low: 85, medium: 65, high: 45 };
+          params.quality = qualityMap[compressionQuality] || 65;
+          break;
+        }
         case "protect":
           params.password = password.trim();
           break;
@@ -907,7 +958,10 @@ export default function ToolProcessorScreen() {
             },
           ]);
           break;
-        case "hyperlinks":
+        case "hyperlinks": {
+          const linkPages = pageInput.trim()
+            ? parsePageInput(pageInput)
+            : [];
           params.links = JSON.stringify([
             {
               url: linkUrl,
@@ -915,9 +969,11 @@ export default function ToolProcessorScreen() {
               pageNumber: visualPlacement.pageNumber,
               x: visualPlacement.x,
               y: visualPlacement.y,
+              ...(linkPages.length > 0 ? { pages: linkPages } : {}),
             },
           ]);
           break;
+        }
         case "redact": {
           // Use visual placement for redaction area
           params.pageNumber = visualPlacement.pageNumber;
@@ -927,14 +983,11 @@ export default function ToolProcessorScreen() {
           params.height = visualPlacement.height || 40;
           break;
         }
-        case "create-form": {
-          // Filter out fields with empty names
-          const validFields = formFields.filter((f) => f.name.trim());
-          params.fields = JSON.stringify(validFields);
-          if (formTitle.trim()) params.formTitle = formTitle;
-          if (formDescription.trim()) params.formDescription = formDescription;
+        case "find-replace":
+          params.search = frSearchText;
+          params.replace = frReplaceText;
+          params.caseSensitive = frCaseSensitive ? "true" : "false";
           break;
-        }
         case "fill-form": {
           // Build key-value map from fill form fields
           const fillData: Record<string, string> = {};
@@ -1224,8 +1277,20 @@ export default function ToolProcessorScreen() {
                         return <ValidateResultUI data={data} t={t} />;
                       if (currentTool === "info")
                         return <InfoResultUI data={data} t={t} />;
-                      if (currentTool === "diff" || currentTool === "compare")
-                        return <DiffResultUI data={data} t={t} />;
+                      if (currentTool === "diff" || currentTool === "compare") {
+                        let file2Name = "Modified";
+                        try {
+                          const af = JSON.parse(additionalFiles as string || "[]");
+                          if (af[0]?.name) file2Name = af[0].name;
+                        } catch {}
+                        return (
+                          <DiffResultUI
+                            data={data}
+                            t={t}
+                            fileNames={[file as string, file2Name]}
+                          />
+                        );
+                      }
                       if (currentTool === "search")
                         return (
                           <SearchResultUI
@@ -1327,7 +1392,7 @@ export default function ToolProcessorScreen() {
                 </View>
 
                 {/* Compress Options */}
-                {tool === "compress" && (
+                {(tool === "compress" || tool === "optimize-images") && (
                   <View style={[styles.section, { backgroundColor: t.card }]}>
                     <Text style={[styles.sectionTitle, { color: t.text }]}>
                       Compression Quality
@@ -1376,7 +1441,7 @@ export default function ToolProcessorScreen() {
                 )}
 
                 {/* Rotate Options */}
-                {tool === "rotate" && (
+                {(tool === "rotate" || tool === "fix-orientation") && (
                   <View style={[styles.section, { backgroundColor: t.card }]}>
                     <Text style={[styles.sectionTitle, { color: t.text }]}>
                       Rotation Angle
@@ -1409,6 +1474,29 @@ export default function ToolProcessorScreen() {
                         </TouchableOpacity>
                       ))}
                     </View>
+
+                    {/* Page scope for fix-orientation */}
+                    {tool === "fix-orientation" && (
+                      <View style={{ marginTop: spacing.md }}>
+                        <Text style={[styles.helperText, { color: t.textSecondary, marginBottom: spacing.xs }]}>
+                          Apply to pages (leave empty for all pages)
+                        </Text>
+                        <TextInput
+                          value={pageInput}
+                          onChangeText={setPageInput}
+                          placeholder="e.g. 1, 3, 5-7"
+                          placeholderTextColor={t.textTertiary}
+                          style={[
+                            styles.textInput,
+                            {
+                              backgroundColor: t.backgroundSecondary,
+                              color: t.text,
+                            },
+                          ]}
+                          keyboardType="numbers-and-punctuation"
+                        />
+                      </View>
+                    )}
                   </View>
                 )}
 
@@ -2089,6 +2177,7 @@ export default function ToolProcessorScreen() {
                         placement={visualPlacement}
                         onPlacementChange={setVisualPlacement}
                         previewLabel={noteText.slice(0, 30) || "Text"}
+                        onScrollLock={setScrollLocked}
                         t={t}
                       />
                     </View>
@@ -2156,6 +2245,7 @@ export default function ToolProcessorScreen() {
                         placement={visualPlacement}
                         onPlacementChange={setVisualPlacement}
                         previewLabel={stampType.toUpperCase()}
+                        onScrollLock={setScrollLocked}
                         t={t}
                       />
                     </View>
@@ -2509,6 +2599,66 @@ export default function ToolProcessorScreen() {
                   </View>
                 )}
 
+                {/* Find & Replace */}
+                {tool === "find-replace" && (
+                  <View style={[styles.section, { backgroundColor: t.card }]}>
+                    <Text style={[styles.sectionTitle, { color: t.text }]}>
+                      Find & Replace
+                    </Text>
+                    <Text style={[styles.helperText, { color: t.textSecondary, marginBottom: spacing.sm }]}>
+                      Find text in your PDF and replace it with new text.
+                    </Text>
+                    <Text style={{ fontSize: 12, color: t.textSecondary, marginBottom: 4 }}>Find</Text>
+                    <TextInput
+                      value={frSearchText}
+                      onChangeText={setFrSearchText}
+                      placeholder="Text to find..."
+                      placeholderTextColor={t.textTertiary}
+                      style={[
+                        styles.textInput,
+                        { backgroundColor: t.backgroundSecondary, color: t.text, marginBottom: spacing.sm },
+                      ]}
+                      autoFocus
+                    />
+                    <Text style={{ fontSize: 12, color: t.textSecondary, marginBottom: 4 }}>Replace with</Text>
+                    <TextInput
+                      value={frReplaceText}
+                      onChangeText={setFrReplaceText}
+                      placeholder="Replacement text..."
+                      placeholderTextColor={t.textTertiary}
+                      style={[
+                        styles.textInput,
+                        { backgroundColor: t.backgroundSecondary, color: t.text, marginBottom: spacing.sm },
+                      ]}
+                    />
+                    <TouchableOpacity
+                      onPress={() => setFrCaseSensitive((v) => !v)}
+                      style={{
+                        flexDirection: "row",
+                        alignItems: "center",
+                        gap: 8,
+                        paddingVertical: spacing.xs,
+                      }}
+                    >
+                      <View
+                        style={{
+                          width: 20,
+                          height: 20,
+                          borderRadius: 4,
+                          borderWidth: 1.5,
+                          borderColor: frCaseSensitive ? colors.primary : t.border,
+                          backgroundColor: frCaseSensitive ? colors.primary : "transparent",
+                          alignItems: "center",
+                          justifyContent: "center",
+                        }}
+                      >
+                        {frCaseSensitive && <Check size={14} color="#fff" />}
+                      </View>
+                      <Text style={{ fontSize: 14, color: t.text }}>Case sensitive</Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
+
                 {/* Bookmarks */}
                 {tool === "bookmarks" && (
                   <View style={[styles.section, { backgroundColor: t.card }]}>
@@ -2601,11 +2751,26 @@ export default function ToolProcessorScreen() {
                       style={[
                         styles.textInput,
                         {
+                          marginBottom: spacing.sm,
+                          backgroundColor: t.backgroundSecondary,
+                          color: t.text,
+                        },
+                      ]}
+                    />
+                    <TextInput
+                      value={pageInput}
+                      onChangeText={setPageInput}
+                      placeholder="Page number(s) e.g. 1, 3, 5-7 (leave empty for placed page only)"
+                      placeholderTextColor={t.textTertiary}
+                      style={[
+                        styles.textInput,
+                        {
                           marginBottom: spacing.md,
                           backgroundColor: t.backgroundSecondary,
                           color: t.text,
                         },
                       ]}
+                      keyboardType="numbers-and-punctuation"
                     />
                     <VisualToolEditor
                       toolType="hyperlinks"
@@ -2617,6 +2782,7 @@ export default function ToolProcessorScreen() {
                       placement={visualPlacement}
                       onPlacementChange={setVisualPlacement}
                       previewLabel={linkText || linkUrl || "Link"}
+                      onScrollLock={setScrollLocked}
                       t={t}
                     />
                   </View>
@@ -2631,27 +2797,30 @@ export default function ToolProcessorScreen() {
 
                     {/* Page scope selector */}
                     <View style={{ marginBottom: spacing.md }}>
-                      <Text style={[styles.helperText, { color: t.textSecondary, marginBottom: spacing.xs }]}>
+                      <Text style={[styles.helperText, { color: t.textSecondary, marginBottom: spacing.sm }]}>
                         Apply crop to
                       </Text>
-                      <View style={{ flexDirection: "row", gap: spacing.xs }}>
+                      <View style={{ flexDirection: "row", gap: spacing.sm }}>
                         {(["all", "custom"] as const).map((val) => {
                           const isActive = cropApplyTo === val;
                           return (
                             <TouchableOpacity
                               key={val}
                               onPress={() => setCropApplyTo(val)}
-                              style={[
-                                styles.optionButton,
-                                {
-                                  backgroundColor: t.backgroundSecondary,
-                                  flex: 0,
-                                  paddingHorizontal: spacing.md,
-                                },
-                                isActive && styles.optionButtonActive,
-                              ]}
+                              style={{
+                                paddingHorizontal: 16,
+                                paddingVertical: 10,
+                                borderRadius: 10,
+                                borderWidth: 1.5,
+                                borderColor: isActive ? colors.primary : t.border,
+                                backgroundColor: isActive ? colors.primary + "15" : t.backgroundSecondary,
+                              }}
                             >
-                              <Text style={[styles.optionText, { color: t.text }, isActive && styles.optionTextActive]}>
+                              <Text style={{
+                                fontSize: 14,
+                                fontWeight: isActive ? "700" : "500",
+                                color: isActive ? colors.primary : t.text,
+                              }}>
                                 {val === "all" ? "All pages" : "Selected pages"}
                               </Text>
                             </TouchableOpacity>
@@ -2660,16 +2829,38 @@ export default function ToolProcessorScreen() {
                       </View>
                       {cropApplyTo === "custom" && (
                         <View style={{ marginTop: spacing.sm }}>
-                          <TextInput
-                            value={cropPageInput}
-                            onChangeText={setCropPageInput}
-                            placeholder="e.g. 1, 3, 5-7"
-                            placeholderTextColor={t.textTertiary}
-                            style={[styles.textInput, { backgroundColor: t.backgroundSecondary, color: t.text }]}
-                            keyboardType="numbers-and-punctuation"
-                          />
+                          <View style={{ flexDirection: "row", gap: spacing.sm, alignItems: "center" }}>
+                            <TextInput
+                              value={cropPageInput}
+                              onChangeText={setCropPageInput}
+                              placeholder="e.g. 1, 3, 5-7"
+                              placeholderTextColor={t.textTertiary}
+                              style={[styles.textInput, { backgroundColor: t.backgroundSecondary, color: t.text, flex: 1 }]}
+                              keyboardType="numbers-and-punctuation"
+                              onSubmitEditing={() => {
+                                const pages = parsePageInput(cropPageInput);
+                                if (pages.length > 0) setCropPreviewPage(pages[0]);
+                              }}
+                            />
+                            <TouchableOpacity
+                              onPress={() => {
+                                const pages = parsePageInput(cropPageInput);
+                                if (pages.length > 0) {
+                                  setCropPreviewPage(pages[0]);
+                                }
+                              }}
+                              style={{
+                                paddingHorizontal: 18,
+                                paddingVertical: 12,
+                                borderRadius: 10,
+                                backgroundColor: colors.primary,
+                              }}
+                            >
+                              <Text style={{ color: "#fff", fontSize: 14, fontWeight: "700" }}>Go</Text>
+                            </TouchableOpacity>
+                          </View>
                           <Text style={{ fontSize: 11, color: t.textTertiary, marginTop: 4 }}>
-                            Enter page numbers or ranges (e.g. 1, 3-5, 8)
+                            Enter pages then tap Go to preview. Crop applies only to these pages.
                           </Text>
                         </View>
                       )}
@@ -2684,6 +2875,7 @@ export default function ToolProcessorScreen() {
                       cropMargins={cropMargins}
                       onCropChange={setCropMargins}
                       onScrollLock={setScrollLocked}
+                      requestedPage={cropPreviewPage}
                       t={t}
                     />
                   </View>
@@ -2745,97 +2937,76 @@ export default function ToolProcessorScreen() {
                       placement={visualPlacement}
                       onPlacementChange={setVisualPlacement}
                       previewLabel="Redacted"
+                      onScrollLock={setScrollLocked}
                       t={t}
                     />
                   </View>
                 )}
 
-                {/* Create Form - Google Forms-style builder */}
-                {tool === "create-form" && (
-                  <CreateFormBuilder
-                    formFields={formFields}
-                    setFormFields={setFormFields}
-                    formTitle={formTitle}
-                    setFormTitle={setFormTitle}
-                    formDescription={formDescription}
-                    setFormDescription={setFormDescription}
-                    t={t}
-                  />
-                )}
-
                 {/* Fill Form - Professional structured layout */}
                 {tool === "fill-form" && (
                   <View style={{ gap: spacing.sm }}>
-                    {/* Form Header Card */}
-                    <View style={{ borderRadius: 12, overflow: "hidden", backgroundColor: t.card }}>
-                      <View style={{ height: 6, backgroundColor: t.primary }} />
-                      <View style={{ padding: spacing.md }}>
-                        <Text style={{ fontSize: 18, fontWeight: "700", color: t.text, marginBottom: 6 }}>
-                          Fill Form
-                        </Text>
-                        <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginBottom: 10 }}>
-                          <FileText color={t.primary} size={16} />
-                          <Text style={{ color: t.textSecondary, fontSize: 13, flex: 1 }} numberOfLines={1}>
-                            {file}
-                          </Text>
-                        </View>
-                        {!fillFormLoading && fillFormFields.length > 0 && (
-                          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-                            <View style={{ flex: 1, height: 6, borderRadius: 3, overflow: "hidden", backgroundColor: t.backgroundSecondary }}>
-                              <View
-                                style={{
-                                  height: "100%",
-                                  borderRadius: 3,
-                                  width: `${fillFormFields.length > 0 ? (fillFormFields.filter((f) => f.value.trim()).length / fillFormFields.length) * 100 : 0}%`,
-                                  backgroundColor: t.primary,
-                                }}
-                              />
-                            </View>
-                            <Text style={{ color: t.primary, fontSize: 12, fontWeight: "600" }}>
-                              {fillFormFields.filter((f) => f.value.trim()).length}/{fillFormFields.length}
-                            </Text>
-                          </View>
-                        )}
-                      </View>
-                    </View>
-
                     {fillFormLoading && (
                       <View style={{ alignItems: "center", paddingVertical: spacing.xl, backgroundColor: t.card, borderRadius: 12 }}>
                         <ActivityIndicator size="large" color={t.primary} />
-                        <Text style={{ color: t.textSecondary, fontSize: 14, marginTop: spacing.md, textAlign: "center" }}>
-                          Scanning PDF for form fields...
+                        <Text style={{ color: t.textSecondary, fontSize: 14, marginTop: spacing.md }}>
+                          Scanning for form fields…
                         </Text>
                       </View>
                     )}
 
-                    {!fillFormLoading && fillFormFields.length > 0 && (
+                    {!fillFormLoading && (
                       <>
-                        <Text style={{ color: t.textSecondary, fontSize: 13, paddingHorizontal: 4, marginBottom: spacing.xs }}>
-                          {fillFormFields[0].name
-                            ? `${fillFormFields.length} field(s) detected. Fill in values and tap Process.`
-                            : "No fields auto-detected. Add field names and values manually."}
-                        </Text>
+                        {/* Progress bar */}
+                        {fillFormFields.some((f) => f.name) && (
+                          <View style={{ backgroundColor: t.card, borderRadius: 12, padding: spacing.md }}>
+                            <View style={{ flexDirection: "row", justifyContent: "space-between", marginBottom: 6 }}>
+                              <Text style={{ color: t.textSecondary, fontSize: 12 }}>
+                                {fillFormFields[0]?.name
+                                  ? `${fillFormFields.length} field${fillFormFields.length !== 1 ? "s" : ""} detected`
+                                  : "Add fields below"}
+                              </Text>
+                              <Text style={{ color: t.primary, fontSize: 12, fontWeight: "700" }}>
+                                {fillFormFields.filter((f) => f.value.trim()).length}/{fillFormFields.length} filled
+                              </Text>
+                            </View>
+                            <View style={{ height: 4, borderRadius: 2, backgroundColor: t.backgroundSecondary, overflow: "hidden" }}>
+                              <View style={{
+                                height: "100%", borderRadius: 2, backgroundColor: t.primary,
+                                width: `${fillFormFields.length > 0 ? (fillFormFields.filter((f) => f.value.trim()).length / fillFormFields.length) * 100 : 0}%`,
+                              }} />
+                            </View>
+                          </View>
+                        )}
 
-                        {fillFormFields.map((field, index) => (
-                          <View
-                            key={index}
-                            style={{
-                              backgroundColor: t.card,
-                              borderRadius: 12,
-                              padding: spacing.md,
-                              borderLeftWidth: 3,
-                              borderLeftColor: field.value.trim() ? "#10B981" : t.border,
-                            }}
-                          >
-                            <View style={{ flexDirection: "row", alignItems: "center", marginBottom: 8 }}>
-                              <View style={{ backgroundColor: t.primary + "15", width: 26, height: 26, borderRadius: 13, alignItems: "center", justifyContent: "center", marginRight: 8 }}>
-                                <Text style={{ color: t.primary, fontSize: 11, fontWeight: "700" }}>{index + 1}</Text>
-                              </View>
-                              {field.name ? (
-                                <Text style={{ color: t.text, fontSize: 14, fontWeight: "600", flex: 1 }}>
-                                  {field.name}
-                                </Text>
-                              ) : (
+                        {fillFormFields.map((field, index) => {
+                          const isCheckbox = field.type === "checkbox";
+                          const isDropdown = field.type === "dropdown" || field.type === "radio" || field.type === "listbox";
+                          const filled = field.value.trim().length > 0;
+                          return (
+                            <View
+                              key={index}
+                              style={{
+                                backgroundColor: t.card,
+                                borderRadius: 12,
+                                padding: spacing.md,
+                                borderLeftWidth: 3,
+                                borderLeftColor: filled ? "#10B981" : t.border,
+                              }}
+                            >
+                              {/* Field name row */}
+                              <View style={{ flexDirection: "row", alignItems: "center", marginBottom: isCheckbox ? 0 : 10 }}>
+                                <View style={{
+                                  width: 28, height: 28, borderRadius: 8, alignItems: "center", justifyContent: "center", marginRight: 10,
+                                  backgroundColor: isCheckbox ? "#F59E0B15" : isDropdown ? "#8B5CF615" : t.primary + "15",
+                                }}>
+                                  <Text style={{
+                                    fontSize: 10, fontWeight: "800",
+                                    color: isCheckbox ? "#F59E0B" : isDropdown ? "#8B5CF6" : t.primary,
+                                  }}>
+                                    {isCheckbox ? "☑" : isDropdown ? "▼" : "T"}
+                                  </Text>
+                                </View>
                                 <TextInput
                                   value={field.name}
                                   onChangeText={(v) => {
@@ -2845,63 +3016,100 @@ export default function ToolProcessorScreen() {
                                   }}
                                   placeholder="Field name"
                                   placeholderTextColor={t.textTertiary}
-                                  style={{ flex: 1, fontSize: 14, fontWeight: "600", color: t.text, padding: 0 }}
+                                  style={{ flex: 1, fontSize: 14, fontWeight: "600", color: t.text, paddingVertical: 0 }}
+                                  editable={!field.name || true}
                                 />
-                              )}
-                              {field.value.trim() ? (
-                                <CheckCircle color="#10B981" size={18} />
-                              ) : null}
-                              {!field.name && (
+                                {filled && <CheckCircle color="#10B981" size={16} style={{ marginLeft: 6 }} />}
                                 <TouchableOpacity
                                   onPress={() => {
                                     const updated = fillFormFields.filter((_, i) => i !== index);
-                                    setFillFormFields(updated.length > 0 ? updated : [{ name: "", value: "" }]);
+                                    setFillFormFields(updated.length > 0 ? updated : [{ name: "", value: "", type: "text" }]);
                                   }}
-                                  style={{ padding: 4 }}
+                                  style={{ padding: 4, marginLeft: 4 }}
                                 >
-                                  <Trash2 color="#EF4444" size={16} />
+                                  <Trash2 color={t.textTertiary} size={15} />
                                 </TouchableOpacity>
+                              </View>
+
+                              {/* Value input */}
+                              {isCheckbox ? (
+                                <TouchableOpacity
+                                  onPress={() => {
+                                    const updated = [...fillFormFields];
+                                    updated[index] = { ...updated[index], value: field.value === "true" ? "false" : "true" };
+                                    setFillFormFields(updated);
+                                  }}
+                                  style={{ flexDirection: "row", alignItems: "center", marginTop: 8, gap: 8 }}
+                                >
+                                  <View style={{
+                                    width: 22, height: 22, borderRadius: 4, borderWidth: 2,
+                                    borderColor: field.value === "true" ? "#10B981" : t.border,
+                                    backgroundColor: field.value === "true" ? "#10B981" : "transparent",
+                                    alignItems: "center", justifyContent: "center",
+                                  }}>
+                                    {field.value === "true" && <Check color="#fff" size={14} />}
+                                  </View>
+                                  <Text style={{ color: t.textSecondary, fontSize: 13 }}>
+                                    {field.value === "true" ? "Checked" : "Unchecked"}
+                                  </Text>
+                                </TouchableOpacity>
+                              ) : isDropdown && field.options && field.options.length > 0 ? (
+                                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 4 }}>
+                                  {field.options.map((opt) => (
+                                    <TouchableOpacity
+                                      key={opt}
+                                      onPress={() => {
+                                        const updated = [...fillFormFields];
+                                        updated[index] = { ...updated[index], value: opt };
+                                        setFillFormFields(updated);
+                                      }}
+                                      style={{
+                                        paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20,
+                                        backgroundColor: field.value === opt ? "#8B5CF6" : t.backgroundSecondary,
+                                        borderWidth: 1, borderColor: field.value === opt ? "#8B5CF6" : t.border,
+                                      }}
+                                    >
+                                      <Text style={{ color: field.value === opt ? "#fff" : t.text, fontSize: 13 }}>{opt}</Text>
+                                    </TouchableOpacity>
+                                  ))}
+                                </View>
+                              ) : (
+                                <TextInput
+                                  value={field.value}
+                                  onChangeText={(v) => {
+                                    const updated = [...fillFormFields];
+                                    updated[index] = { ...updated[index], value: v };
+                                    setFillFormFields(updated);
+                                  }}
+                                  placeholder={`Enter ${field.name || "value"}…`}
+                                  placeholderTextColor={t.textTertiary}
+                                  style={[
+                                    styles.textInput,
+                                    {
+                                      backgroundColor: t.backgroundSecondary,
+                                      color: t.text,
+                                      borderWidth: 1,
+                                      borderColor: filled ? "#10B981" + "40" : t.border,
+                                      marginBottom: 0,
+                                    },
+                                  ]}
+                                />
                               )}
                             </View>
-                            <TextInput
-                              value={field.value}
-                              onChangeText={(v) => {
-                                const updated = [...fillFormFields];
-                                updated[index] = { ...updated[index], value: v };
-                                setFillFormFields(updated);
-                              }}
-                              placeholder="Enter value..."
-                              placeholderTextColor={t.textTertiary}
-                              style={[
-                                styles.textInput,
-                                {
-                                  backgroundColor: t.backgroundSecondary,
-                                  color: t.text,
-                                  borderWidth: 1,
-                                  borderColor: field.value.trim() ? "#10B981" + "30" : t.border,
-                                },
-                              ]}
-                            />
-                          </View>
-                        ))}
+                          );
+                        })}
 
                         <TouchableOpacity
-                          onPress={() => setFillFormFields([...fillFormFields, { name: "", value: "" }])}
+                          onPress={() => setFillFormFields([...fillFormFields, { name: "", value: "", type: "text" }])}
                           style={{
-                            flexDirection: "row",
-                            alignItems: "center",
-                            justifyContent: "center",
-                            backgroundColor: t.card,
-                            borderRadius: 12,
-                            padding: spacing.md,
-                            borderWidth: 1,
-                            borderColor: t.primary + "30",
-                            borderStyle: "dashed",
+                            flexDirection: "row", alignItems: "center", justifyContent: "center",
+                            backgroundColor: t.card, borderRadius: 12, padding: spacing.md,
+                            borderWidth: 1, borderColor: t.primary + "30", borderStyle: "dashed",
                           }}
                         >
                           <Plus color={t.primary} size={18} />
                           <Text style={{ color: t.primary, fontWeight: "600", marginLeft: spacing.xs }}>
-                            Add Field Manually
+                            Add Field
                           </Text>
                         </TouchableOpacity>
                       </>
@@ -2987,6 +3195,12 @@ export default function ToolProcessorScreen() {
           </ScrollView>
         </Pressable>
       </KeyboardAvoidingView>
+      <LibraryFilePicker
+        visible={showAttachLibraryPicker}
+        onClose={() => setShowAttachLibraryPicker(false)}
+        onSelect={handleAttachLibrarySelect}
+        title="Select Files to Attach"
+      />
     </SafeAreaView>
   );
 }

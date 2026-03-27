@@ -125,9 +125,7 @@ export default function RootLayout() {
           <Stack.Screen name="extract-images" />
           <Stack.Screen name="batch-compress" />
           <Stack.Screen name="find-replace" />
-          <Stack.Screen name="true-redact" />
           <Stack.Screen name="qr-code" />
-          <Stack.Screen name="lock-document" />
           <Stack.Screen name="highlight-export" />
           <Stack.Screen name="citation-extractor" />
         </Stack>

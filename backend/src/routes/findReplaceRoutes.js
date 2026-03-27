@@ -28,6 +28,18 @@ router.post("/preview", async (req, res, next) => {
     const { pages } = await extractTextWithPositions(
       req.files.pdf.tempFilePath,
     );
+
+    // Check if the PDF has any extractable text at all
+    const totalTextItems = pages.reduce((sum, p) => sum + p.items.length, 0);
+    if (totalTextItems === 0) {
+      return res.json({
+        matches: [],
+        total: 0,
+        warning:
+          "This PDF contains no extractable text. It may be a scanned document or image-based PDF.",
+      });
+    }
+
     const { matches, total } = findMatches(pages, searchText, {
       caseSensitive,
     });
@@ -79,6 +91,16 @@ router.post("/", async (req, res, next) => {
     const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
 
     const { pages } = await extractTextWithPositions(inputPath);
+
+    // Check if the PDF has any extractable text
+    const totalTextItems = pages.reduce((sum, p) => sum + p.items.length, 0);
+    if (totalTextItems === 0) {
+      return res.status(400).json({
+        error:
+          "This PDF contains no extractable text. It may be a scanned document or image-based PDF. Find & Replace only works with text-based PDFs.",
+      });
+    }
+
     const { matches } = findMatches(pages, searchText, { caseSensitive });
 
     if (matches.length === 0) {
@@ -93,42 +115,52 @@ router.post("/", async (req, res, next) => {
       const page = pdfPages[match.pageIdx];
       if (!page) continue;
 
-      for (const region of match.regions) {
-        const padding = 2;
-        const x = region.x - padding;
-        const y = region.y - region.h * 0.3;
-        const w = region.w + padding * 2;
-        const h = region.h * 1.3;
+      // Compute bounding box that covers ALL regions of this match
+      let coverMinX = Infinity, coverMinY = Infinity;
+      let coverMaxX = -Infinity, coverMaxY = -Infinity;
 
-        // Cover original text with white rectangle
+      for (const region of match.regions) {
+        // No horizontal padding — pad=4 was creating visible gaps between
+        // the replacement and surrounding words.
+        // Vertical: keep generous coverage so ascenders/descenders are hidden.
+        const rx = region.x;
+        const ry = region.y - region.h * 0.4;
+        const rw = region.w;
+        const rh = region.h * 1.5;
+
+        coverMinX = Math.min(coverMinX, rx);
+        coverMinY = Math.min(coverMinY, ry);
+        coverMaxX = Math.max(coverMaxX, rx + rw);
+        coverMaxY = Math.max(coverMaxY, ry + rh);
+
+        // Cover each region individually with a white rectangle
         page.drawRectangle({
-          x,
-          y,
-          width: w,
-          height: h,
+          x: rx,
+          y: ry,
+          width: rw,
+          height: rh,
           color: rgb(1, 1, 1),
           borderWidth: 0,
         });
+      }
 
-        // Optional highlight behind replacement
-        if (highlightHex) {
-          const c = hexToRgb(highlightHex);
-          const highlightW = replaceText
-            ? font.widthOfTextAtSize(
-                replaceText,
-                Math.max(region.h * 0.85, 8),
-              ) + padding * 2
-            : w;
-          page.drawRectangle({
-            x,
-            y,
-            width: highlightW,
-            height: h,
-            color: rgb(c.r / 255, c.g / 255, c.b / 255),
-            opacity: 0.3,
-            borderWidth: 0,
-          });
-        }
+      // Optional highlight behind replacement
+      if (highlightHex) {
+        const c = hexToRgb(highlightHex);
+        const firstRegion = match.regions[0];
+        const fontSize = Math.max(firstRegion.h * 0.85, 8);
+        const highlightW = replaceText
+          ? font.widthOfTextAtSize(replaceText, fontSize) + 8
+          : coverMaxX - coverMinX;
+        page.drawRectangle({
+          x: coverMinX,
+          y: coverMinY,
+          width: highlightW,
+          height: coverMaxY - coverMinY,
+          color: rgb(c.r / 255, c.g / 255, c.b / 255),
+          opacity: 0.3,
+          borderWidth: 0,
+        });
       }
 
       // Draw replacement text at the first region's position

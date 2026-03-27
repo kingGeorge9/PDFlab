@@ -17,7 +17,6 @@ import {
   FileText,
   Info,
   Lock,
-  Plus,
   Search,
   XCircle,
 } from "lucide-react-native";
@@ -50,6 +49,7 @@ interface ResultProps {
   data: any;
   t: ThemeColors;
   searchQuery?: string;
+  fileNames?: [string, string];
 }
 
 // ============================================================================
@@ -71,6 +71,7 @@ const formatValue = (value: any): string => {
     if (value > 1000) return value.toLocaleString();
     return String(value);
   }
+  if (Array.isArray(value)) return value.join(", ");
   if (typeof value === "object") return JSON.stringify(value, null, 2);
   return String(value);
 };
@@ -285,12 +286,15 @@ export const InfoResultUI = ({ data, t }: ResultProps) => {
   const STRUCTURE_KEYS = [
     "paragraphs",
     "images",
+    "imageCount",
     "forms",
     "hasForm",
+    "formFieldCount",
     "hasEmbeddedFiles",
     "annotations",
+    "annotationCount",
   ];
-  const FONT_KEYS = ["fonts", "fontList", "fontCount"];
+  const FONT_KEYS = ["fonts", "fontList", "fontCount", "fontNames"];
   const SECURITY_KEYS = [
     "encrypted",
     "isEncrypted",
@@ -298,7 +302,7 @@ export const InfoResultUI = ({ data, t }: ResultProps) => {
     "encryptionType",
     "keyLength",
   ];
-  const PAGE_KEYS = ["pageWidth", "pageHeight", "pageDimensions"];
+  const PAGE_KEYS = ["pageWidth", "pageHeight", "pageRotation", "pageDimensions"];
 
   const allKnown = [
     ...GENERAL_KEYS,
@@ -649,7 +653,7 @@ export const ValidateResultUI = ({ data, t }: ResultProps) => {
 // 3. DIFF / COMPARE — Unique visual identity with gauge + diff lines
 // ============================================================================
 
-export const DiffResultUI = ({ data, t }: ResultProps) => {
+export const DiffResultUI = ({ data, t, fileNames }: ResultProps) => {
   if (!data || typeof data !== "object") return null;
 
   const [activeTab, setActiveTab] = useState<"summary" | "differences">(
@@ -748,7 +752,7 @@ export const DiffResultUI = ({ data, t }: ResultProps) => {
       {activeTab === "summary" && hasSummary && (
         <View style={{ flexDirection: "row", gap: 10 }}>
           {["pdf1", "pdf2"].map((key, idx) => {
-            const label = idx === 0 ? "Original" : "Modified";
+            const label = fileNames?.[idx] || (idx === 0 ? "Original" : "Modified");
             const accent =
               idx === 0 ? themeColors.error : themeColors.success;
             return (
@@ -1123,347 +1127,7 @@ export const SearchResultUI = ({ data, t, searchQuery }: ResultProps) => {
   );
 };
 
-// ============================================================================
-// 5. CREATE FORM BUILDER — Title/desc + multi-option checkboxes
-// ============================================================================
-
-export interface FormField {
-  name: string;
-  type: "text" | "checkbox";
-  options?: string[];
-}
-
-interface CreateFormProps {
-  formFields: FormField[];
-  setFormFields: (fields: FormField[]) => void;
-  formTitle: string;
-  setFormTitle: (title: string) => void;
-  formDescription: string;
-  setFormDescription: (desc: string) => void;
-  t: ThemeColors;
-}
-
-export const CreateFormBuilder = ({
-  formFields,
-  setFormFields,
-  formTitle,
-  setFormTitle,
-  formDescription,
-  setFormDescription,
-  t,
-}: CreateFormProps) => {
-  const addField = (type: FormField["type"] = "text") => {
-    const newField: FormField = { name: "", type };
-    if (type === "checkbox") newField.options = ["Option 1"];
-    setFormFields([...formFields, newField]);
-  };
-
-  const updateField = (index: number, updates: Partial<FormField>) => {
-    const updated = [...formFields];
-    updated[index] = { ...updated[index], ...updates };
-    setFormFields(updated);
-  };
-
-  const removeField = (index: number) => {
-    if (formFields.length <= 1) return;
-    setFormFields(formFields.filter((_, i) => i !== index));
-  };
-
-  const moveField = (index: number, direction: -1 | 1) => {
-    const newIndex = index + direction;
-    if (newIndex < 0 || newIndex >= formFields.length) return;
-    const updated = [...formFields];
-    [updated[index], updated[newIndex]] = [
-      updated[newIndex],
-      updated[index],
-    ];
-    setFormFields(updated);
-  };
-
-  return (
-    <View style={{ gap: 12 }}>
-      {/* Form header with real inputs */}
-      <View
-        style={[
-          cfs.headerCard,
-          { backgroundColor: t.card, borderTopColor: t.primary },
-        ]}
-      >
-        <View style={[cfs.headerAccent, { backgroundColor: t.primary }]} />
-        <View style={{ padding: spacing.md }}>
-          <TextInput
-            value={formTitle}
-            onChangeText={setFormTitle}
-            placeholder="Form Title"
-            placeholderTextColor={t.textTertiary}
-            style={[
-              cfs.titleInput,
-              { borderBottomColor: t.border, color: t.text },
-            ]}
-          />
-          <TextInput
-            value={formDescription}
-            onChangeText={setFormDescription}
-            placeholder="Form description (optional)"
-            placeholderTextColor={t.textTertiary}
-            style={[
-              cfs.descInput,
-              { borderBottomColor: t.border + "60", color: t.text },
-            ]}
-          />
-        </View>
-      </View>
-
-      {/* Field cards */}
-      {formFields.map((field, index) => (
-        <View
-          key={index}
-          style={[
-            cfs.fieldCard,
-            { backgroundColor: t.card, borderColor: t.border },
-          ]}
-        >
-          {/* Field header */}
-          <View style={cfs.fieldHeader}>
-            <View
-              style={[
-                cfs.fieldNumber,
-                { backgroundColor: t.primary + "15" },
-              ]}
-            >
-              <Text
-                style={{
-                  color: t.primary,
-                  fontSize: 12,
-                  fontWeight: "700",
-                }}
-              >
-                {index + 1}
-              </Text>
-            </View>
-            <TextInput
-              value={field.name}
-              onChangeText={(v) => updateField(index, { name: v })}
-              placeholder={`Field ${index + 1} name`}
-              placeholderTextColor={t.textTertiary}
-              style={{
-                flex: 1,
-                fontSize: 14,
-                fontWeight: "600",
-                color: t.text,
-                padding: 0,
-              }}
-            />
-            <View
-              style={[
-                cfs.typeBadge,
-                { backgroundColor: t.backgroundSecondary },
-              ]}
-            >
-              <Text
-                style={{
-                  color: t.textSecondary,
-                  fontSize: 11,
-                  fontWeight: "600",
-                }}
-              >
-                {field.type === "text" ? "Short Answer" : "Checkbox"}
-              </Text>
-            </View>
-          </View>
-
-          {/* Field preview / content */}
-          <View style={cfs.fieldPreview}>
-            {field.type === "text" && (
-              <View
-                style={[
-                  cfs.previewTextLine,
-                  { borderBottomColor: t.border },
-                ]}
-              >
-                <Text style={{ color: t.textTertiary, fontSize: 13 }}>
-                  Short answer text
-                </Text>
-              </View>
-            )}
-            {field.type === "checkbox" && (
-              <View style={{ gap: 8 }}>
-                {(field.options || ["Option 1"]).map((opt, optIdx) => (
-                  <View
-                    key={optIdx}
-                    style={{
-                      flexDirection: "row",
-                      alignItems: "center",
-                      gap: 8,
-                    }}
-                  >
-                    <View
-                      style={[cfs.checkbox, { borderColor: t.border }]}
-                    />
-                    <TextInput
-                      value={opt}
-                      onChangeText={(v) => {
-                        const opts = [
-                          ...(field.options || ["Option 1"]),
-                        ];
-                        opts[optIdx] = v;
-                        updateField(index, { options: opts });
-                      }}
-                      placeholder={`Option ${optIdx + 1}`}
-                      placeholderTextColor={t.textTertiary}
-                      style={{
-                        flex: 1,
-                        fontSize: 13,
-                        color: t.text,
-                        padding: 0,
-                      }}
-                    />
-                    {(field.options?.length || 1) > 1 && (
-                      <TouchableOpacity
-                        onPress={() => {
-                          const opts = (field.options || []).filter(
-                            (_, i) => i !== optIdx,
-                          );
-                          updateField(index, { options: opts });
-                        }}
-                        style={{ padding: 4 }}
-                      >
-                        <XCircle color={themeColors.error} size={14} />
-                      </TouchableOpacity>
-                    )}
-                  </View>
-                ))}
-                <TouchableOpacity
-                  onPress={() => {
-                    const opts = [
-                      ...(field.options || ["Option 1"]),
-                      `Option ${(field.options?.length || 1) + 1}`,
-                    ];
-                    updateField(index, { options: opts });
-                  }}
-                  style={{
-                    flexDirection: "row",
-                    alignItems: "center",
-                    gap: 4,
-                    paddingVertical: 4,
-                  }}
-                >
-                  <Plus color={t.primary} size={14} />
-                  <Text
-                    style={{
-                      color: t.primary,
-                      fontSize: 12,
-                      fontWeight: "600",
-                    }}
-                  >
-                    Add option
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            )}
-          </View>
-
-          {/* Field actions */}
-          <View
-            style={[cfs.fieldActions, { borderTopColor: t.border + "40" }]}
-          >
-            <TouchableOpacity
-              onPress={() => moveField(index, -1)}
-              disabled={index === 0}
-              style={[cfs.actionBtn, index === 0 && { opacity: 0.3 }]}
-            >
-              <ChevronUp color={t.textSecondary} size={18} />
-            </TouchableOpacity>
-            <TouchableOpacity
-              onPress={() => moveField(index, 1)}
-              disabled={index === formFields.length - 1}
-              style={[
-                cfs.actionBtn,
-                index === formFields.length - 1 && { opacity: 0.3 },
-              ]}
-            >
-              <ChevronDown color={t.textSecondary} size={18} />
-            </TouchableOpacity>
-            <View style={{ flex: 1 }} />
-            <TouchableOpacity
-              onPress={() =>
-                updateField(index, {
-                  type: field.type === "text" ? "checkbox" : "text",
-                  options:
-                    field.type === "text" ? ["Option 1"] : undefined,
-                })
-              }
-              style={[cfs.actionBtn, { paddingHorizontal: 10 }]}
-            >
-              <Text
-                style={{
-                  color: t.primary,
-                  fontSize: 12,
-                  fontWeight: "600",
-                }}
-              >
-                {field.type === "text" ? "Text" : "Checkbox"}
-              </Text>
-            </TouchableOpacity>
-            {formFields.length > 1 && (
-              <TouchableOpacity
-                onPress={() => removeField(index)}
-                style={cfs.actionBtn}
-              >
-                <XCircle color={themeColors.error} size={18} />
-              </TouchableOpacity>
-            )}
-          </View>
-        </View>
-      ))}
-
-      {/* Add field buttons */}
-      <View style={{ flexDirection: "row", gap: 8 }}>
-        <TouchableOpacity
-          onPress={() => addField("text")}
-          style={[
-            cfs.addButton,
-            {
-              backgroundColor: t.primary + "10",
-              borderColor: t.primary + "30",
-            },
-          ]}
-        >
-          <Text
-            style={{
-              color: t.primary,
-              fontWeight: "600",
-              fontSize: 13,
-            }}
-          >
-            + Text Field
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          onPress={() => addField("checkbox")}
-          style={[
-            cfs.addButton,
-            {
-              backgroundColor: themeColors.success + "10",
-              borderColor: themeColors.success + "30",
-            },
-          ]}
-        >
-          <Text
-            style={{
-              color: themeColors.success,
-              fontWeight: "600",
-              fontSize: 13,
-            }}
-          >
-            + Checkbox
-          </Text>
-        </TouchableOpacity>
-      </View>
-    </View>
-  );
-};
-
+// [CreateFormBuilder removed — tool purged per requirements]
 // ============================================================================
 // DEFAULT / FALLBACK RENDERER
 // ============================================================================
@@ -1878,82 +1542,3 @@ const diffS = StyleSheet.create({
   },
 });
 
-// Create form styles
-const cfs = StyleSheet.create({
-  headerCard: {
-    borderRadius: 12,
-    overflow: "hidden",
-    borderTopWidth: 0,
-  },
-  headerAccent: {
-    height: 8,
-  },
-  titleInput: {
-    fontSize: 22,
-    fontWeight: "600",
-    borderBottomWidth: 2,
-    paddingBottom: 8,
-    marginBottom: 8,
-  },
-  descInput: {
-    fontSize: 14,
-    borderBottomWidth: 1,
-    paddingBottom: 6,
-  },
-  fieldCard: {
-    borderRadius: 12,
-    borderWidth: 1,
-    overflow: "hidden",
-  },
-  fieldHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    padding: 12,
-    gap: 8,
-  },
-  fieldNumber: {
-    width: 26,
-    height: 26,
-    borderRadius: 13,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  typeBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 8,
-  },
-  fieldPreview: {
-    paddingHorizontal: 12,
-    paddingBottom: 12,
-  },
-  previewTextLine: {
-    borderBottomWidth: 1,
-    paddingBottom: 6,
-  },
-  checkbox: {
-    width: 18,
-    height: 18,
-    borderRadius: 3,
-    borderWidth: 2,
-  },
-  fieldActions: {
-    flexDirection: "row",
-    alignItems: "center",
-    borderTopWidth: 1,
-    padding: 6,
-    gap: 4,
-  },
-  actionBtn: {
-    padding: 6,
-    borderRadius: 6,
-  },
-  addButton: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderStyle: "dashed",
-    alignItems: "center",
-  },
-});

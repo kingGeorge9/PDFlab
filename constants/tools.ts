@@ -171,16 +171,6 @@ export const toolCategories = [
         name: "Sign Document",
         description: "Sign PDF with handwritten signature",
       },
-      {
-        id: "true-redact",
-        name: "True Redaction",
-        description: "Permanently remove sensitive info",
-      },
-      {
-        id: "lock-document",
-        name: "Lock Document",
-        description: "Set expiry & access control",
-      },
     ],
   },
   {
@@ -253,11 +243,6 @@ export const toolCategories = [
     name: "Forms & Fill",
     color: "#F59E0B",
     tools: [
-      {
-        id: "create-form",
-        name: "Create Form",
-        description: "Make fillable forms",
-      },
       { id: "fill-form", name: "Fill Form", description: "Fill PDF forms" },
       {
         id: "flatten",

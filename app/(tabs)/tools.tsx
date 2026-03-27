@@ -89,7 +89,6 @@ const TOOLS_REQUIRING_PDF = new Set([
   "metadata",
   "search",
   "validate",
-  "create-form",
   "fill-form",
   "extract-data",
   "diff",
@@ -102,7 +101,6 @@ const TOOLS_REQUIRING_PDF = new Set([
   // New dedicated-screen tools that need PDF input
   "extract-images",
   "find-replace",
-  "true-redact",
   "highlight-export",
   "citation-extractor",
 ]);
@@ -112,9 +110,7 @@ const DEDICATED_SCREEN_TOOLS: Record<string, string> = {
   "extract-images": "/extract-images",
   "batch-compress": "/batch-compress",
   "find-replace": "/find-replace",
-  "true-redact": "/true-redact",
   "qr-code": "/qr-code",
-  "lock-document": "/lock-document",
   "highlight-export": "/highlight-export",
   "citation-extractor": "/citation-extractor",
 };
@@ -211,12 +207,6 @@ export default function ToolsScreen() {
       return;
     }
 
-    // Lock document: navigate directly (has its own file picker)
-    if (toolId === "lock-document") {
-      router.push("/lock-document" as any);
-      return;
-    }
-
     // Text to PDF: navigate directly to tool-processor with text input (no file needed)
     if (toolId === "text-to-pdf") {
       router.push({
@@ -228,44 +218,6 @@ export default function ToolsScreen() {
           fileMimeType: "text/plain",
         },
       });
-      return;
-    }
-
-    // Create form: offer "Blank Form" option alongside file pickers
-    if (toolId === "create-form") {
-      Alert.alert(
-        "Create Form",
-        "Start from a blank page or add fields to an existing PDF.",
-        [
-          {
-            text: "Blank Form",
-            onPress: () => {
-              router.push({
-                pathname: "/tool-processor",
-                params: {
-                  tool: "create-form",
-                  file: "blank-form.pdf",
-                  fileUri: "",
-                  fileMimeType: "application/pdf",
-                },
-              });
-            },
-          },
-          {
-            text: "Pick from Device / App",
-            onPress: () => {
-              setPendingTool({
-                toolId,
-                mimeTypes: ["application/pdf"],
-                allowedExtensions: ["pdf"],
-                allowMultiple: false,
-              });
-              setShowSourcePicker(true);
-            },
-          },
-          { text: "Cancel", style: "cancel" },
-        ],
-      );
       return;
     }
 

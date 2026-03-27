@@ -4,11 +4,9 @@ const crypto = require("crypto");
 const os = require("os");
 
 const OUTPUTS_DIR = path.join(os.tmpdir(), "docu-assistant-outputs");
-const LOCK_DATA_DIR = path.join(os.tmpdir(), "docu-assistant-locks");
 
 // Ensure directories exist
 fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
-fs.mkdirSync(LOCK_DATA_DIR, { recursive: true });
 
 /**
  * Returns a unique output file path for a given extension.
@@ -75,7 +73,6 @@ function startOutputCleanup(intervalMs = 3600000) {
 
 module.exports = {
   OUTPUTS_DIR,
-  LOCK_DATA_DIR,
   outputPath,
   tempFilePath,
   toDownloadUrl,

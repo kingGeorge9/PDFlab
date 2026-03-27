@@ -9,6 +9,7 @@ const {
   isEncryptedPDFLabFile,
 } = require("../services/pdfLabEncryption");
 const fs = require("fs").promises;
+const { outputPath, toDownloadUrl } = require("../utils/fileOutputUtils");
 
 // ── Route-level request logging ──────────────────────────────────────────────
 router.use((req, res, next) => {
@@ -179,36 +180,64 @@ router.post("/split", async (req, res) => {
       });
     }
 
-    const ranges = JSON.parse(pageRanges);
+    let ranges = JSON.parse(pageRanges);
+    const splitAfterLastPoint = req.body.splitAfterLastPoint === "true";
+
+    // If splitAfterLastPoint is set, append remaining pages as a final range
+    if (splitAfterLastPoint && ranges.length > 0) {
+      const pdfBytes = await fs.readFile(req.files.pdf.tempFilePath);
+      const { PDFDocument } = require("pdf-lib");
+      const tmpDoc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+      const totalPages = tmpDoc.getPageCount();
+
+      // Find highest page index used in existing ranges
+      let maxPage = -1;
+      for (const range of ranges) {
+        for (const p of range) {
+          if (p > maxPage) maxPage = p;
+        }
+      }
+
+      // Add remaining pages if any
+      if (maxPage + 1 < totalPages) {
+        const remaining = [];
+        for (let p = maxPage + 1; p < totalPages; p++) remaining.push(p);
+        ranges.push(remaining);
+      }
+    }
+
     console.log(`✂️  Splitting PDF into ${ranges.length} parts...`);
+
+    // Derive a clean base name from the original file
+    const origName = (req.files.pdf.name || "document")
+      .replace(/\.pdf$/i, "")
+      .replace(/[^\w\s-]/g, "")
+      .trim() || "document";
 
     const splitPdfs = await pdfService.splitPDF(req.files.pdf, ranges);
 
     const duration = Date.now() - startTime;
-    console.log(`✅ Split completed in ${duration}ms`);
+    console.log(`✅ Split completed in ${duration}ms — ${splitPdfs.length} parts`);
 
-    if (splitPdfs.length === 1) {
-      // Single split part — return as PDF
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=split-1.pdf");
-      res.setHeader("X-Processing-Time", `${duration}ms`);
-      res.send(splitPdfs[0]);
-    } else {
-      // Multiple split parts — return as ZIP
-      const archiver = require("archiver");
-      res.setHeader("Content-Type", "application/zip");
-      res.setHeader("Content-Disposition", "attachment; filename=split.zip");
-      res.setHeader("X-Processing-Time", `${duration}ms`);
-
-      const archive = archiver("zip", { zlib: { level: 6 } });
-      archive.pipe(res);
-
-      splitPdfs.forEach((pdfBuffer, index) => {
-        archive.append(pdfBuffer, { name: `part_${index + 1}.pdf` });
+    // Save each part as an individual PDF and return download URLs
+    const files = [];
+    for (let i = 0; i < splitPdfs.length; i++) {
+      const filename = `${origName}_part_${i + 1}.pdf`;
+      const outFile = outputPath(".pdf");
+      await fs.writeFile(outFile, splitPdfs[i]);
+      files.push({
+        filename,
+        url: toDownloadUrl(req, outFile),
+        size: splitPdfs[i].length,
       });
-
-      await archive.finalize();
     }
+
+    return res.json({
+      success: true,
+      totalParts: files.length,
+      files,
+      processingTime: `${duration}ms`,
+    });
   } catch (error) {
     console.error("❌ Split error:", error);
     res.status(500).json({
@@ -437,18 +466,24 @@ router.post("/compress", async (req, res) => {
     }
 
     const { quality } = req.body; // 'low', 'medium', 'high'
-    console.log(`🗜️  Compressing PDF (quality: ${quality || "medium"})...`);
+    const originalSize = req.files.pdf.size;
+    console.log(`🗜️  Compressing PDF (quality: ${quality || "medium"}, original: ${originalSize} bytes)...`);
     const resultPdf = await pdfService.compressPDF(
       req.files.pdf,
       quality || "medium",
     );
 
     const duration = Date.now() - startTime;
-    console.log(`✅ Compression completed in ${duration}ms`);
+    const compressedSize = resultPdf.length;
+    const reduction = ((originalSize - compressedSize) / originalSize * 100).toFixed(1);
+    console.log(`✅ Compression completed in ${duration}ms — ${originalSize} → ${compressedSize} (${reduction}% reduction)`);
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", "attachment; filename=compressed.pdf");
     res.setHeader("X-Processing-Time", `${duration}ms`);
+    res.setHeader("X-Original-Size", String(originalSize));
+    res.setHeader("X-Compressed-Size", String(compressedSize));
+    res.setHeader("X-Compression-Reduction", `${reduction}%`);
     res.send(resultPdf);
   } catch (error) {
     console.error("❌ Compress error:", error);
@@ -577,15 +612,28 @@ router.post("/repair", async (req, res) => {
       return res.status(400).json({ error: "No file uploaded" });
     }
 
+    console.log(`🔧 Repairing PDF: ${req.files.pdf.name} (${req.files.pdf.size} bytes)`);
     const { buffer, strategy } = await repairPdf(req.files.pdf.tempFilePath);
+
+    // Validate the repaired PDF is actually loadable
+    const { PDFDocument: PDFDocCheck } = require("pdf-lib");
+    const doc = await PDFDocCheck.load(buffer, { ignoreEncryption: true, throwOnInvalidObject: false });
+    const pageCount = doc.getPageCount();
+    console.log(`✅ Repair succeeded via ${strategy} — ${pageCount} pages, ${buffer.length} bytes`);
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", "attachment; filename=repaired.pdf");
     res.setHeader("X-Repair-Strategy", strategy);
+    res.setHeader("X-Page-Count", String(pageCount));
     res.send(buffer);
   } catch (error) {
     console.error("Repair error:", error);
-    res.status(500).json({ error: error.message || "Failed to repair PDF" });
+    const isBeyondRecovery = error.message?.includes("beyond recovery");
+    res.status(isBeyondRecovery ? 422 : 500).json({
+      error: isBeyondRecovery
+        ? "File is severely corrupted and cannot be repaired"
+        : error.message || "Failed to repair PDF",
+    });
   }
 });
 
@@ -597,13 +645,23 @@ router.post("/optimize-images", async (req, res) => {
     }
 
     const { quality } = req.body;
+    const originalSize = req.files.pdf.size;
+    console.log(`🖼️  Optimizing images (quality: ${quality || 80}, original: ${originalSize} bytes)`);
+
     const resultPdf = await pdfService.optimizeImagesPDF(
       req.files.pdf,
       parseInt(quality) || 80,
     );
 
+    const compressedSize = resultPdf.length;
+    const reduction = ((originalSize - compressedSize) / originalSize * 100).toFixed(1);
+    console.log(`✅ Image optimization done — ${originalSize} → ${compressedSize} (${reduction}% reduction)`);
+
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", "attachment; filename=optimized.pdf");
+    res.setHeader("X-Original-Size", String(originalSize));
+    res.setHeader("X-Optimized-Size", String(compressedSize));
+    res.setHeader("X-Reduction", `${reduction}%`);
     res.send(resultPdf);
   } catch (error) {
     console.error("Optimize images error:", error);
@@ -1078,28 +1136,6 @@ router.post("/validate", async (req, res) => {
   }
 });
 
-// Create form (supports blank PDF if no file uploaded)
-router.post("/create-form", async (req, res) => {
-  try {
-    const file = req.files && req.files.pdf ? req.files.pdf : null;
-    const { fields } = req.body;
-    const parsedFields = fields ? JSON.parse(fields) : [];
-
-    if (parsedFields.length === 0) {
-      return res.status(400).json({ error: "At least one field is required" });
-    }
-
-    const resultPdf = await pdfService.createFormPDF(file, parsedFields);
-
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", "attachment; filename=form.pdf");
-    res.send(resultPdf);
-  } catch (error) {
-    console.error("Create form error:", error);
-    res.status(500).json({ error: error.message || "Failed to create form" });
-  }
-});
-
 // Fill form
 router.post("/fill-form", async (req, res) => {
   try {
@@ -1148,8 +1184,8 @@ router.post("/extract-data", async (req, res) => {
       return res.status(400).json({ error: "No file uploaded" });
     }
 
-    const formData = await pdfService.extractFormDataPDF(req.files.pdf);
-    res.json({ formData });
+    const result = await pdfService.extractFormDataPDF(req.files.pdf);
+    res.json(result);
   } catch (error) {
     console.error("Extract form data error:", error);
     res.status(500).json({ error: error.message || "Failed to extract form data" });
@@ -1163,14 +1199,11 @@ router.post("/compare", async (req, res) => {
       return res.status(400).json({ error: "Two PDF files required" });
     }
 
-    const resultPdf = await pdfService.comparePDFs(
+    const differences = await pdfService.diffPDFs(
       req.files.pdf1,
       req.files.pdf2,
     );
-
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", "attachment; filename=comparison.pdf");
-    res.send(resultPdf);
+    res.json(differences);
   } catch (error) {
     console.error("Compare error:", error);
     res.status(500).json({ error: error.message || "Failed to compare PDFs" });
@@ -1285,7 +1318,30 @@ router.post("/fix-orientation", async (req, res) => {
       return res.status(400).json({ error: "No file uploaded" });
     }
 
-    const resultPdf = await pdfService.fixOrientationPDF(req.files.pdf);
+    const rotation = parseInt(req.body.rotation) || 90;
+    // Parse page indices: accept JSON array of 0-based indices or comma-separated 1-based page numbers
+    let pageIndices = null;
+    if (req.body.pages) {
+      try {
+        const parsed = JSON.parse(req.body.pages);
+        // Frontend sends 1-based page numbers — convert to 0-based
+        pageIndices = Array.isArray(parsed)
+          ? parsed.map((p) => p - 1)
+          : null;
+      } catch {
+        // comma-separated fallback
+        pageIndices = req.body.pages
+          .split(",")
+          .map((s) => parseInt(s.trim()) - 1)
+          .filter((n) => !isNaN(n));
+      }
+    }
+
+    const resultPdf = await pdfService.fixOrientationPDF(
+      req.files.pdf,
+      rotation,
+      pageIndices,
+    );
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
